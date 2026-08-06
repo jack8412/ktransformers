@@ -626,6 +626,17 @@ if __name__ == "__main__":
             traceback.print_exc()
             print(f"[FAIL] {name}: {e}")
             failed.append(name)
+    # Tear the worker pools down while the interpreter is alive: leaving two
+    # live CPUInfer instances (this module's cache + the NativeMoEWrapper
+    # singleton from the e2e tests) to static destructors aborts on exit.
+    import gc
+
+    _cpu_infer_cache.clear()
+    base_mod = sys.modules.get("kt_kernel.experts_base")
+    if base_mod is not None:
+        base_mod._MoEBase._cpu_infer_instance = None
+    gc.collect()
+
     if failed:
         print(f"\n{len(failed)} test(s) failed: {failed}")
         sys.exit(1)

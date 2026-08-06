@@ -45,7 +45,9 @@ DEFAULT_EXPERT_NUM = 896
 MXFP4_GS = 32
 FP8_GS = 128
 
-DEFAULT_M_LIST = [1, 64]
+# M=1: decode. M=64: prefill-sized batch (crosses the mat-mat dispatch boundary
+# 4*E/top_k only when experts < 256). M=512: crosses it even at the full E=896.
+DEFAULT_M_LIST = [1, 64, 512]
 ROUTING_POOL = 32
 
 WORKER_NUMA = 2
@@ -93,7 +95,12 @@ def synth_fp8(expert_num, gen):
 
 def synth_bf16(expert_num, gen):
     def one(n, k):
-        return (torch.randn((expert_num, n, k), generator=gen, dtype=torch.float32) / 100).to(torch.bfloat16).contiguous()
+        # Per-expert chunks: avoids a full [E, N, K] fp32 transient (OOM risk on
+        # shared hosts) — peak extra memory is one expert's fp32 matrix.
+        t = torch.empty((expert_num, n, k), dtype=torch.bfloat16)
+        for e in range(expert_num):
+            t[e] = (torch.randn((n, k), generator=gen, dtype=torch.float32) / 100).to(torch.bfloat16)
+        return t.contiguous()
 
     return {"gate_w": one(INTER, HIDDEN), "up_w": one(INTER, HIDDEN), "down_w": one(HIDDEN, INTER)}
 
@@ -188,6 +195,11 @@ def bench_one_m(backend, moe, cpu_infer, M, routing, warmup, iters, gen):
     per_iter_us = total / iters * 1e6
     tok_per_s = M * iters / total
     gbps = unique_sum * bytes_per_expert(backend) / total / 1e9
+    # MXFP4/MXFP8 dispatch mat-vec vs mat-mat on qlen > 4 * expert_num / top_k;
+    # report which path this M measured so a "prefill" row that stayed on the
+    # decode kernel (e.g. M=64 with the full 896 experts -> boundary 224) is
+    # visible in the table. FP8 always uses its vec kernel; INT8 always tiles.
+    dispatch_boundary = 4 * moe_expert_num / TOP_K
     return {
         "M": M,
         "iters": iters,
@@ -195,6 +207,7 @@ def bench_one_m(backend, moe, cpu_infer, M, routing, warmup, iters, gen):
         "tokens_per_s": tok_per_s,
         "weight_gbps": gbps,
         "avg_unique_experts": unique_sum / iters,
+        "mxfp4_path": "mat-mat" if M > dispatch_boundary else "mat-vec",
     }
 
 
@@ -271,7 +284,8 @@ def main():
             rows.append(r)
             print(
                 f"  M={M:>4}  per-iter={r['per_iter_us']:>10.1f} us  tok/s={r['tokens_per_s']:>9.1f}  "
-                f"weights={r['weight_gbps']:>7.1f} GB/s  uniq_e={r['avg_unique_experts']:.1f}"
+                f"weights={r['weight_gbps']:>7.1f} GB/s  uniq_e={r['avg_unique_experts']:.1f}  "
+                f"[mxfp4 dispatch: {r['mxfp4_path']}]"
             )
         all_rows[backend] = rows
         del moe

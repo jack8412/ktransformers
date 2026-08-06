@@ -571,6 +571,8 @@ class NativeMoEWrapper(BaseMoEWrapper):
         swiglu_alpha: float = 0.0,
     ):
         self._swiglu_alpha = float(swiglu_alpha)
+        # Kept for load-time TP-slicing validation (BaseMoEWrapper does not store it).
+        self.threadpool_count = int(threadpool_count)
         # Defence in depth: reject swiglu_limit on non-MXFP4/MXFP8 methods even
         # if the experts.py guard is bypassed (e.g., by a future caller
         # that constructs NativeMoEWrapper directly). Origin: kt-sglang 耦合.
@@ -741,6 +743,17 @@ class NativeMoEWrapper(BaseMoEWrapper):
                 continue
         if weights is None:
             raise ValueError(f"No experts found for layer {self.layer_idx} under any prefix: {_candidates}")
+        # The loaders count experts by sequential key probing, and the base
+        # SafeTensorLoader tolerates unreadable shards (print + continue), so a
+        # missing shard would silently truncate the expert list; the C++ side
+        # indexes per-expert pointer lists up to expert_num unchecked.
+        loaded_experts = len(weights["gate"])
+        if loaded_experts != self.num_experts:
+            raise ValueError(
+                f"Loader found {loaded_experts} experts for layer {self.layer_idx}, expected "
+                f"num_experts={self.num_experts}. A checkpoint shard may have failed to open "
+                f"(see loader warnings above) or the checkpoint is truncated."
+            )
         t1 = time.time()
 
         # Keep individual tensors instead of stacking - avoid expensive memory copy
@@ -865,6 +878,18 @@ class NativeMoEWrapper(BaseMoEWrapper):
                     f"{group_size} from gate scale shape {tuple(self.gate_scales[0].shape)} "
                     f"vs hidden_size={self.hidden_size}. The MXFP4 kernels hard-code "
                     f"32-wide k-groups."
+                )
+            # Validate TP slicing here: the C++ derived_init checks run on NUMA
+            # worker threads, where a throw aborts the process instead of
+            # raising. BufferB requires 32-aligned dims after the per-subpool
+            # intermediate split.
+            tp = max(1, self.threadpool_count)
+            if self.hidden_size % 32 != 0 or self.moe_intermediate_size % tp != 0 or (self.moe_intermediate_size // tp) % 32 != 0:
+                raise ValueError(
+                    f"MXFP4 requires hidden_size % 32 == 0 and (moe_intermediate_size / "
+                    f"threadpool_count) % 32 == 0; got hidden_size={self.hidden_size}, "
+                    f"moe_intermediate_size={self.moe_intermediate_size}, "
+                    f"threadpool_count={tp}."
                 )
             moe_config.quant_config.bits = 4
             moe_config.quant_config.group_size = group_size

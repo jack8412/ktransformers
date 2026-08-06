@@ -118,8 +118,8 @@ BUILTIN_MODELS: list[ModelInfo] = [
             "served-model-name": "Kimi-K3",
             "disable-shared-experts-fusion": True,
         },
-        description="Moonshot Kimi K3 MoE model (native MXFP4 experts, latent routed-expert MoE)",
-        description_zh="月之暗面 Kimi K3 MoE 模型（原生 MXFP4 专家，latent 路由专家 MoE）",
+        description="Moonshot Kimi K3 MoE model (native MXFP4 experts; CPU-side SiTU activation support pending)",
+        description_zh="月之暗面 Kimi K3 MoE 模型（原生 MXFP4 专家；CPU 侧 SiTU 激活支持待补）",
     ),
     ModelInfo(
         name="Kimi-K2-Thinking",
