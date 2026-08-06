@@ -376,8 +376,14 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
 
   void derived_init() {
     auto& quant_config = config_.quant_config;
-    if (quant_config.group_size == 0 || quant_config.zero_point) {
-      throw std::runtime_error("MXFP4 MoE only supports KGroup FP4");
+    // fp4_mat_vec_kgroup / fp4_mat_mat_kgroup hard-code kg_count = k / 32, so any
+    // other group_size would silently read the wrong scales.
+    if (quant_config.group_size != 32 || quant_config.zero_point) {
+      throw std::runtime_error("MXFP4 MoE requires group_size == 32 and no zero_point");
+    }
+    if (config_.hidden_size % quant_config.group_size != 0 ||
+        config_.intermediate_size % quant_config.group_size != 0) {
+      throw std::runtime_error("MXFP4 MoE: hidden_size and intermediate_size must be divisible by group_size");
     }
     printf("Creating AMX_FP4_MOE_TP %d at numa %d\n", tp_part_idx, numa_node_of_cpu(sched_getcpu()));
   }
@@ -433,8 +439,8 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     const uint64_t* physical_to_logical_map = (const uint64_t*)config_.physical_to_logical_map;
     auto pool = config_.pool->get_subpool(tp_part_idx);
 
-    if (quant_config.group_size == 0 || quant_config.zero_point)
-      throw std::runtime_error("MXFP4 MoE only support KGroup FP4.");
+    if (quant_config.group_size != 32 || quant_config.zero_point)
+      throw std::runtime_error("MXFP4 MoE requires group_size == 32 and no zero_point");
     if (config_.gate_scale == nullptr) throw std::runtime_error("MXFP4 MoE only support load native weight.");
 
     int nth = T::recommended_nth(config_.intermediate_size);
