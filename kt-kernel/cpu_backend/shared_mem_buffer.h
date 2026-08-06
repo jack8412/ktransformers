@@ -40,11 +40,15 @@ class SharedMemBuffer {
   ~SharedMemBuffer();
 
   void alloc(void* object, MemoryRequest requests);
+  // Drop `object`'s registered requests. Must be called from the owner's
+  // destructor: a later, larger alloc() re-bases EVERY registered request, so
+  // stale entries would write through pointers into freed objects.
+  void dealloc(void* object);
 
  private:
   void* buffer;
   uint64_t size;
-  std::vector<MemoryRequest> object_requests;
+  std::map<void*, std::vector<MemoryRequest>> object_requests;
 };
 
 static SharedMemBuffer shared_mem_buffer;
@@ -56,6 +60,7 @@ class SharedMemBufferNuma {
 
  public:
   void alloc(int numa, void* object, MemoryRequest requests);
+  void dealloc(void* object);
 };
 
 static SharedMemBufferNuma shared_mem_buffer_numa;

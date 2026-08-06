@@ -48,7 +48,7 @@ SharedMemBuffer::~SharedMemBuffer() {
 
 void SharedMemBuffer::alloc(void* object, MemoryRequest requests) {
   size_t total_size = requests.total_size();
-  object_requests.push_back(requests);
+  object_requests[object].push_back(requests);
 
   if (total_size > size) {
     if (buffer) {
@@ -64,13 +64,17 @@ void SharedMemBuffer::alloc(void* object, MemoryRequest requests) {
     }
     buffer = newbuf;
     size = total_size;
-    for (auto& req : object_requests) {
-      req.update_base_ptr(buffer);
+    for (auto& [obj, reqs] : object_requests) {
+      for (auto& req : reqs) {
+        req.update_base_ptr(buffer);
+      }
     }
   } else {
     requests.update_base_ptr(buffer);
   }
 }
+
+void SharedMemBuffer::dealloc(void* object) { object_requests.erase(object); }
 
 void SharedMemBufferNuma::alloc(int numa, void* object, MemoryRequest requests) {
   std::lock_guard<std::mutex> guard(lock);
@@ -82,4 +86,11 @@ void SharedMemBufferNuma::alloc(int numa, void* object, MemoryRequest requests) 
   }
   // printf("numa %d alloc for %lx\n", numa,reinterpret_cast<intptr_t> (object));
   numa_mem.at(numa)->alloc(object, requests);
+}
+
+void SharedMemBufferNuma::dealloc(void* object) {
+  std::lock_guard<std::mutex> guard(lock);
+  for (auto& [numa, buf] : numa_mem) {
+    buf->dealloc(object);
+  }
 }

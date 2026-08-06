@@ -147,7 +147,12 @@ class AMX_MOE_BASE {
     shared_mem_buffer_numa.alloc(tp_part_idx, this, mem_requests);
   }
 
-  ~AMX_MOE_BASE() = default;
+  ~AMX_MOE_BASE() {
+    // Unregister our scratch requests: SharedMemBuffer re-bases every
+    // registered request when a later, larger alloc grows the pool, so stale
+    // entries would write into this freed object (use-after-free).
+    shared_mem_buffer_numa.dealloc(this);
+  }
 
   void warm_up() {
     int qlen = config_.max_len;

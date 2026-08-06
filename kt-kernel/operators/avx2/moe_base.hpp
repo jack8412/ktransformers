@@ -156,6 +156,9 @@ class AVX2_MOE_BASE {
   }
 
   virtual ~AVX2_MOE_BASE() {
+    // See AMX_MOE_BASE::~AMX_MOE_BASE: stale requests would be re-based into
+    // this freed object by a later, larger shared-buffer alloc.
+    shared_mem_buffer_numa.dealloc(this);
     for (void* p : owned_aligned_allocs_) std::free(p);
   }
 

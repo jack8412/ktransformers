@@ -139,6 +139,11 @@ class TP_MOE_Common : public MoE_Interface {
     shared_mem_buffer.alloc(this, mem_requests);
   }
 
+  virtual ~TP_MOE_Common() {
+    // Unregister local_output requests; see SharedMemBuffer::dealloc.
+    shared_mem_buffer.dealloc(this);
+  }
+
   void warm_up() {
     int qlen = config.max_possible_qlen();
     std::vector<uint8_t> input(sizeof(ggml_bf16_t) * qlen * config.hidden_size);
