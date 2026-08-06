@@ -857,8 +857,15 @@ class NativeMoEWrapper(BaseMoEWrapper):
             self.moe = backend_cls(moe_config)
         elif self.method == "MXFP4":
             # MXFP4: E2M1 nibble-packed weights, ue8m0/bf16 per-32 group scale
-            # (e.g. DeepSeek-V4-Flash routed experts)
+            # (e.g. DeepSeek-V4-Flash and Kimi-K3 routed experts)
             group_size = self.hidden_size // self.gate_scales[0].shape[1]
+            if group_size != 32:
+                raise ValueError(
+                    f"MXFP4 requires group_size == 32 (OCP MX block size); inferred "
+                    f"{group_size} from gate scale shape {tuple(self.gate_scales[0].shape)} "
+                    f"vs hidden_size={self.hidden_size}. The MXFP4 kernels hard-code "
+                    f"32-wide k-groups."
+                )
             moe_config.quant_config.bits = 4
             moe_config.quant_config.group_size = group_size
             moe_config.quant_config.zero_point = False

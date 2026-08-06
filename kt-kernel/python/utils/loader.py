@@ -1183,27 +1183,41 @@ class GPTQSafeTensorLoader(FP8SafeTensorLoader):
 
 
 class MXFP4SafeTensorLoader(SafeTensorLoader):
-    """Loader for native MXFP4 expert weights (DeepSeek-V4-Flash format).
+    """Loader for native MXFP4 expert weights.
 
-    Per expert layout:
+    Supported per-expert layouts, probed in order:
+
+    DeepSeek-V4-Flash:
       {base}.ffn.experts.{i}.w1.weight  I8       [N, K/2]   nibble-packed E2M1 (gate)
       {base}.ffn.experts.{i}.w1.scale   F8_E8M0  [N, K/32]  ue8m0 group scale
       {base}.ffn.experts.{i}.w3.{weight,scale}              up
       {base}.ffn.experts.{i}.w2.{weight,scale}              down
 
-    V4 ckpt keys are not prefixed with ``model.``; we also probe the stripped form so
-    callers can keep passing ``base_key="model.layers.{L}"``. ue8m0 → bf16 is a lossless
+    Kimi-K3 (compressed-tensors ``mxfp4-pack-quantized``):
+      {base}.block_sparse_moe.experts.{i}.w1.weight_packed  U8  [N, K/2]
+      {base}.block_sparse_moe.experts.{i}.w1.weight_scale   U8  [N, K/32]  ue8m0
+      {base}.block_sparse_moe.experts.{i}.w3.{weight_packed,weight_scale}  up
+      {base}.block_sparse_moe.experts.{i}.w2.{weight_packed,weight_scale}  down
+
+    V4 ckpt keys are not prefixed with ``model.`` and K3 keys carry a
+    ``language_model.model.`` prefix; we also probe the stripped forms so callers
+    can keep passing ``base_key="model.layers.{L}"``. ue8m0 → bf16 is a lossless
     bit shift (both have an 8-bit exponent and zero mantissa for ue8m0), and the AMX
     FP4 backend already consumes bf16 scales.
     """
 
-    EXPERTS_PATH_TPL = "{base}.ffn.experts"
+    # (experts path template, weight suffix, scale suffix), probed in order.
+    EXPERTS_FORMATS = (
+        ("{base}.ffn.experts", "weight", "scale"),  # DeepSeek-V4-Flash
+        ("{base}.block_sparse_moe.experts", "weight_packed", "weight_scale"),  # Kimi-K3
+    )
     PROJ_NAMES = ("w1", "w3", "w2")  # (gate, up, down)
 
-    def _experts_prefix_candidates(self, base_key: str) -> list[str]:
-        candidates = [self.EXPERTS_PATH_TPL.format(base=base_key)]
-        if base_key.startswith("model."):
-            candidates.append(self.EXPERTS_PATH_TPL.format(base=base_key[len("model.") :]))
+    def _experts_prefix_candidates(self, base_key: str, path_tpl: str) -> list[str]:
+        candidates = [path_tpl.format(base=base_key)]
+        for strip in ("language_model.model.", "language_model.", "model."):
+            if base_key.startswith(strip):
+                candidates.append(path_tpl.format(base=base_key[len(strip) :]))
         return list(dict.fromkeys(candidates))
 
     @staticmethod
@@ -1220,18 +1234,25 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
     def load_experts(self, base_key: str, device: str = "cpu"):
         gate_name, up_name, down_name = self.PROJ_NAMES
         prefix = None
+        weight_suffix = scale_suffix = None
         expert_count = 0
-        for cand in self._experts_prefix_candidates(base_key):
-            expert_count = 0
-            while self.has_tensor(f"{cand}.{expert_count}.{gate_name}.weight"):
-                expert_count += 1
-            if expert_count > 0:
-                prefix = cand
+        for path_tpl, w_suffix, s_suffix in self.EXPERTS_FORMATS:
+            for cand in self._experts_prefix_candidates(base_key, path_tpl):
+                expert_count = 0
+                while self.has_tensor(f"{cand}.{expert_count}.{gate_name}.{w_suffix}"):
+                    expert_count += 1
+                if expert_count > 0:
+                    prefix, weight_suffix, scale_suffix = cand, w_suffix, s_suffix
+                    break
+            if prefix is not None:
                 break
         if prefix is None:
-            raise ValueError(
-                f"No MXFP4 experts found under any of: {self._experts_prefix_candidates(base_key)}"
-            )
+            probed = [
+                cand
+                for path_tpl, _, _ in self.EXPERTS_FORMATS
+                for cand in self._experts_prefix_candidates(base_key, path_tpl)
+            ]
+            raise ValueError(f"No MXFP4 experts found under any of: {probed}")
 
         gate_weights = [None] * expert_count
         up_weights = [None] * expert_count
@@ -1246,7 +1267,7 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
                 (up_name, up_weights),
                 (down_name, down_weights),
             ):
-                w = self.load_tensor(f"{prefix}.{exp_id}.{proj}.weight", device).contiguous()
+                w = self.load_tensor(f"{prefix}.{exp_id}.{proj}.{weight_suffix}", device).contiguous()
                 if w.dtype != torch.uint8:
                     w = w.view(torch.uint8)
                 dst[exp_id] = w
@@ -1256,10 +1277,10 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
                 (up_name, up_scales),
                 (down_name, down_scales),
             ):
-                s = self.load_tensor(f"{prefix}.{exp_id}.{proj}.scale", device)
+                s = self.load_tensor(f"{prefix}.{exp_id}.{proj}.{scale_suffix}", device)
                 dst[exp_id] = self._ue8m0_to_bf16(s)
 
-        print(f"[MXFP4SafeTensorLoader] Loaded {expert_count} experts from {prefix}")
+        print(f"[MXFP4SafeTensorLoader] Loaded {expert_count} experts from {prefix} (*.{weight_suffix})")
         return {
             "gate": gate_weights,
             "up": up_weights,
