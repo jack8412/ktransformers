@@ -497,7 +497,7 @@ python -m sglang.launch_server \
 
 | Parameter | Description | Example Value |
 |-----------|-------------|---------------|
-| `--kt-method` | CPU inference backend method | `AMXINT4`, `AMXINT8`, `RAWINT4`, `FP8`, `FP8_PERCHANNEL`, `BF16` or `LLAMAFILE` |
+| `--kt-method` | CPU inference backend method | `AMXINT4`, `AMXINT8`, `RAWINT4`, `FP8`, `FP8_PERCHANNEL`, `MXFP4`, `MXFP8`, `BF16` or `LLAMAFILE` |
 | `--kt-weight-path` | Path to quantized CPU weights | `/path/to/cpu-weights` |
 | `--kt-cpuinfer` | Number of CPU inference threads | `64` (adjust based on CPU cores) |
 | `--kt-threadpool-count` | Number of thread pools for parallel execution | `2` (typically 1-4) |
