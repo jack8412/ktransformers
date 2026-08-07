@@ -470,9 +470,16 @@ def test_situ_rejected_for_silu_only_backends():
         weight_path="/nonexistent",
         chunked_prefill_size=max_len,
     )
-    for bad_method in ("LLAMAFILE", "MOE_INT4", "MOE_INT8"):
+    # LLAMAFILE / MOE_INT* hard-code scalar silu; SYCL_GPTQ_INT4 routes to
+    # NativeMoEWrapper but fuses its activation into device kernels that never
+    # read situ_beta (the base skips apply_activation for it entirely).
+    for bad_method in ("LLAMAFILE", "MOE_INT4", "MOE_INT8", "SYCL_GPTQ_INT4"):
         with pytest.raises(ValueError, match="situ_beta"):
             experts_mod.KTMoEWrapper(method=bad_method, situ_beta=4.0, situ_linear_beta=25.0, **common)
+    # Every method the allow-list claims to support must actually be listed as
+    # an inference method (guards against a typo silently disabling situ).
+    assert experts_mod.SITU_SUPPORTED_METHODS <= experts_mod.INFERENCE_METHODS
+    assert "SYCL_GPTQ_INT4" not in experts_mod.SITU_SUPPORTED_METHODS
     # linear_beta without beta is a config error, not a silent no-op.
     with pytest.raises(ValueError, match="requires situ_beta"):
         experts_mod.KTMoEWrapper(method="MXFP4", situ_beta=0.0, situ_linear_beta=25.0, **common)
