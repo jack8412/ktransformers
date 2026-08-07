@@ -48,6 +48,32 @@ INFERENCE_METHODS = frozenset(
     ]
 )
 
+# Methods whose activation epilogue is amx::act_fn / avx2::act_fn, i.e. the
+# apply_activation in AMX_MOE_BASE / AVX2_MOE_BASE that reads situ_beta.
+# Deliberately an allow-list so a new backend defaults to "situ rejected"
+# rather than silently serving silu. Excluded, and why:
+#   LLAMAFILE, MOE_INT4, MOE_INT8 - hard-coded scalar silu (llamafile/moe.hpp,
+#                                   moe_kernel/moe.hpp)
+#   SYCL_GPTQ_INT4                - defines fused_prefill_experts /
+#                                   decode_gate_up_activation, so the
+#                                   `if constexpr (has_fused_prefill())` branch
+#                                   in the base skips apply_activation entirely
+#                                   and its device kernels only read
+#                                   swiglu_limit/swiglu_alpha
+SITU_SUPPORTED_METHODS = frozenset(
+    [
+        "AMXINT4",
+        "AMXINT8",
+        "RAWINT4",
+        "FP8",
+        "BF16",
+        "FP8_PERCHANNEL",
+        "GPTQ_INT4",
+        "MXFP4",
+        "MXFP8",
+    ]
+)
+
 SFT_METHODS = frozenset(
     [
         "AMXBF16_SFT",  # AMX BF16 training
@@ -386,16 +412,16 @@ def _create_inference_wrapper(
     # into a non-MXFP4 backend; act_fn would then clamp gate/up to ±10 with
     # no warning. Gate strictly on method instead. Origin: kt-sglang 耦合.
     # The situ epilogue lives in amx::act_fn / avx2::act_fn, reached only via
-    # the AMX_MOE_BASE / AVX2_MOE_BASE apply_activation used by the AMX and
-    # Native backends. LLAMAFILE (llamafile/moe.hpp) and MOE_INT4/MOE_INT8
-    # (moe_kernel/moe.hpp) have their own hard-coded scalar silu and would
-    # ignore situ_beta silently, so reject it there.
+    # the AMX_MOE_BASE / AVX2_MOE_BASE apply_activation. Gate on the method
+    # allow-list: some backends routed to NativeMoEWrapper (SYCL_GPTQ_INT4)
+    # fuse their own activation and never read situ_beta.
     if situ_beta != 0.0 or situ_linear_beta != 0.0:
-        if backend_cls in (LlamafileMoEWrapper, GeneralMoEWrapper):
+        if method not in SITU_SUPPORTED_METHODS:
             raise ValueError(
                 f"situ_beta={situ_beta} is not supported by method={method!r} "
-                f"(backend={backend_cls.__name__}): that backend applies a hard-coded "
-                f"silu epilogue. Use an AMX/Native method (e.g. MXFP4) for Kimi-K3."
+                f"(backend={backend_cls.__name__}): that backend does not route through "
+                f"the act_fn epilogue and would silently apply silu instead. "
+                f"Supported: {sorted(SITU_SUPPORTED_METHODS)}."
             )
         if situ_beta <= 0.0:
             raise ValueError(

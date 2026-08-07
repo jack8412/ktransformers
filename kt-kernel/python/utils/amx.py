@@ -592,6 +592,14 @@ class NativeMoEWrapper(BaseMoEWrapper):
                 f"method={method!r}; the clamp only applies to MXFP4/MXFP8. "
                 f"This indicates a missing guard in the caller."
             )
+        # Defence in depth (mirrors the swiglu_limit guard below): SYCL_GPTQ_INT4
+        # is served by this wrapper but fuses its activation into the device
+        # kernels, which never read situ_beta — it would silently run silu.
+        if (situ_beta != 0.0 or situ_linear_beta != 0.0) and method == "SYCL_GPTQ_INT4":
+            raise ValueError(
+                f"NativeMoEWrapper received situ_beta={situ_beta} with method={method!r}; "
+                f"the SYCL backend fuses its own activation epilogue and ignores it."
+            )
         if method == "RAWINT4" and not (
             _HAS_RAWINT4_SUPPORT or _HAS_AVX2_RAWINT4_SUPPORT or _HAS_AVXVNNI256_RAW_INT4_SUPPORT
         ):
@@ -855,7 +863,12 @@ class NativeMoEWrapper(BaseMoEWrapper):
         moe_config.swiglu_limit = self.swiglu_limit
         # Kimi-K3 situ activation (0.0 = disabled). Consumed by amx::act_fn /
         # avx2::act_fn via apply_activation; the factory in experts.py rejects
-        # it for backends that hard-code silu.
+        # it for backends that do not route through that epilogue.
+        if self.situ_beta != 0.0 and self.method == "SYCL_GPTQ_INT4":
+            raise ValueError(
+                f"NativeMoEWrapper.load_weights: situ_beta={self.situ_beta} with "
+                f"method={self.method!r}; the SYCL backend ignores it."
+            )
         moe_config.situ_beta = self.situ_beta
         moe_config.situ_linear_beta = self.situ_linear_beta
 
