@@ -811,9 +811,9 @@ class NativeMoEWrapper(BaseMoEWrapper):
                     self.down_scales = [t.to(torch.float32).contiguous() for t in weights["down_scale"]]
                 assert self.gate_scales[0].dtype == torch.float32, "Expected float32 scales for FP8_PERCHANNEL"
             elif self.method == "MXFP4":
-                # ue8m0 is losslessly representable in bf16 (8-bit exponent, 0 mantissa);
-                # the loader has already done that conversion.
-                assert self.gate_scales[0].dtype == torch.bfloat16, "Expected bf16 scales for MXFP4"
+                # ue8m0 codes stay as raw bytes; the kernels expand them to fp32
+                # at use time (see e8m0_to_fp32 in operators/common.hpp).
+                assert self.gate_scales[0].dtype == torch.uint8, "Expected uint8 (ue8m0) scales for MXFP4"
             elif self.method == "MXFP8":
                 # ue8m0 scales stay as uint8; C++ convert_ue8m0_to_fp32 handles conversion.
                 assert self.gate_scales[0].dtype == torch.uint8, "Expected uint8 (ue8m0) scales for MXFP8"

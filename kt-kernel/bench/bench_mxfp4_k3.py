@@ -8,7 +8,7 @@ thread counts, for decode (M=1) and prefill (M=64) regimes, and reports
 per-iter latency, tokens/s and effective weight bandwidth (GB/s).
 
 Weight bytes per expert (weights + resident scales):
-    MXFP4:  3*I*H * (0.5 + 4/32)   = 0.625 B/elem  (fp32 group scales in RAM)
+    MXFP4:  3*I*H * (0.5 + 1/32)   = 0.53125 B/elem (E8M0 group scales in RAM)
     FP8:    3*I*H * (1 + 4/128^2) ~= 1.0   B/elem
     INT8:   3*I*H * 1.0            (per-row scale negligible)
 
@@ -54,10 +54,21 @@ WORKER_NUMA = 2
 WORKER_THREADS_PER_NUMA = 48
 
 
+def mxfp4_scales_are_resident_bytes():
+    """True on builds that keep E8M0 scales resident as 1 B/group. Older builds
+    widen them to fp32 at load and want bf16 input, so this also selects which
+    scale dtype to synthesize — letting one bench binary A/B both layouts."""
+    return hasattr(kt_kernel_ext.moe, "mxfp4_buffer_bytes")
+
+
 def bytes_per_expert(backend):
     elems = 3 * INTER * HIDDEN
     if backend == "mxfp4":
-        return elems * (0.5 + 4.0 / MXFP4_GS)
+        # Ask the extension for the true resident size when it can tell us.
+        probe = getattr(kt_kernel_ext.moe, "mxfp4_buffer_bytes", None)
+        if probe is not None:
+            return 2 * probe(INTER, HIDDEN, MXFP4_GS) + probe(HIDDEN, INTER, MXFP4_GS)
+        return elems * (0.5 + 4.0 / MXFP4_GS)  # fp32-scale build: 0.625 B/elem
     if backend == "fp8":
         return elems * (1.0 + 4.0 / (FP8_GS * FP8_GS))
     if backend == "int8":
@@ -68,9 +79,11 @@ def bytes_per_expert(backend):
 def synth_mxfp4(expert_num, gen):
     def one(n, k):
         w = torch.randint(0, 256, (expert_num, n, k // 2), generator=gen, dtype=torch.uint8)
-        # ue8m0 exponents around 2^-9..2^-4, converted to bf16 (loader convention)
         e = torch.randint(118, 124, (expert_num, n, k // MXFP4_GS), generator=gen, dtype=torch.int64)
-        s = (e << 7).to(torch.int16).view(torch.bfloat16).contiguous()
+        if mxfp4_scales_are_resident_bytes():
+            s = e.to(torch.uint8).contiguous()  # raw ue8m0 codes
+        else:
+            s = (e << 7).to(torch.int16).view(torch.bfloat16).contiguous()  # legacy bf16 input
         return w.contiguous(), s
 
     gw, gs = one(INTER, HIDDEN)

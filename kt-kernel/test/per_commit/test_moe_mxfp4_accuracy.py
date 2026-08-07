@@ -239,9 +239,9 @@ def build_flat_config(data, hidden=hidden_size, inter=intermediate_size, qlen_ma
     gate_qw = torch.stack(data["packed"]["gate"]).contiguous()
     up_qw = torch.stack(data["packed"]["up"]).contiguous()
     down_qw = torch.stack(data["packed"]["down"]).contiguous()
-    gate_sc = torch.stack(data["scale_bf16"]["gate"]).contiguous()
-    up_sc = torch.stack(data["scale_bf16"]["up"]).contiguous()
-    down_sc = torch.stack(data["scale_bf16"]["down"]).contiguous()
+    gate_sc = torch.stack(data["scale_u8"]["gate"]).contiguous()
+    up_sc = torch.stack(data["scale_u8"]["up"]).contiguous()
+    down_sc = torch.stack(data["scale_u8"]["down"]).contiguous()
 
     config = kt_kernel_ext.moe.MOEConfig(expert_num, num_experts_per_tok, hidden, inter, 0)
     config.max_len = qlen_max
@@ -316,6 +316,30 @@ def test_ue8m0_to_bf16_bitwise():
     ref = ue8m0_to_bf16_ref(all_u8)
     assert got.dtype == torch.bfloat16
     assert torch.equal(got.view(torch.int16), ref.view(torch.int16)), "ue8m0->bf16 must be bit-exact for all 256 codes"
+
+
+def test_mxfp4_resident_footprint():
+    """MXFP4 keeps E8M0 scales resident as 1 B/group, so a weight matrix costs
+    0.5 + 1/32 = 0.53125 B/elem instead of 0.625 with fp32 scales (-15%)."""
+    if not hasattr(kt_kernel_ext.moe, "mxfp4_buffer_bytes"):
+        pytest.skip("mxfp4_buffer_bytes not available (non-AVX512 build)")
+
+    K3_HIDDEN, K3_INTER = 3584, 3072  # Kimi-K3 routed-expert dims
+    for n, k in ((K3_INTER, K3_HIDDEN), (K3_HIDDEN, K3_INTER)):
+        got = kt_kernel_ext.moe.mxfp4_buffer_bytes(n, k, group_size)
+        expect = n * k // 2 + n * (k // group_size)  # both terms 64B-aligned here
+        assert got == expect, f"{n}x{k}: {got} != {expect}"
+        per_elem = got / (n * k)
+        assert abs(per_elem - 0.53125) < 1e-6, f"{n}x{k}: {per_elem} B/elem"
+
+    # Projected full-model expert footprint: 92 MoE layers x 896 experts.
+    params = 92 * 896 * (2 * K3_INTER * K3_HIDDEN + K3_HIDDEN * K3_INTER)
+    resident, prev = params * 0.53125, params * 0.625
+    print(
+        f"  K3 expert params={params/1e12:.2f}e12  resident={resident/1e12:.3f} TB "
+        f"(was {prev/1e12:.3f} TB, saves {(prev-resident)/1e9:.0f} GB)"
+    )
+    assert params == 2722740830208
 
 
 def test_e2m1_lut_tables_match_spec():
@@ -526,8 +550,8 @@ def _assert_loader_dict_matches(weights_dict, data):
             assert weights_dict[proj][e].dtype == torch.uint8
             assert torch.equal(weights_dict[proj][e], data["packed"][proj][e])
             got_scale = weights_dict[f"{proj}_scale"][e]
-            assert got_scale.dtype == torch.bfloat16
-            assert torch.equal(got_scale.view(torch.int16), data["scale_bf16"][proj][e].view(torch.int16))
+            assert got_scale.dtype == torch.uint8, "MXFP4 scales stay resident as raw ue8m0 bytes"
+            assert torch.equal(got_scale, data["scale_u8"][proj][e])
 
 
 def test_k3_naming_loader():
@@ -716,6 +740,7 @@ def test_mxfp4_group_size_guard():
 if __name__ == "__main__":
     tests = [
         test_ue8m0_to_bf16_bitwise,
+        test_mxfp4_resident_footprint,
         test_e2m1_lut_tables_match_spec,
         test_mxfp4_accuracy,
         test_mxfp4_situ_accuracy,

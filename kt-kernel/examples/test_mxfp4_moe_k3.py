@@ -75,9 +75,11 @@ def make_mxfp4_weight(n, k, gen, exp_lo=-9, exp_hi=-4):
     codes_l = codes.to(torch.int64)
     packed = ((codes_l[:, 1::2] << 4) | codes_l[:, 0::2]).to(torch.uint8).contiguous()
     exps = torch.randint(127 + exp_lo, 127 + exp_hi + 1, (n, k // GROUP_SIZE), generator=gen, dtype=torch.int64)
-    scale_bf16 = ((exps << 7).to(torch.int16)).view(torch.bfloat16).contiguous()
-    dequant = E2M1_VALUES[codes_l] * scale_bf16.float().repeat_interleave(GROUP_SIZE, dim=1)
-    return packed, scale_bf16, dequant
+    # Scales stay as raw E8M0 codes — the kernels expand them at use time.
+    scale_u8 = exps.to(torch.uint8).contiguous()
+    scale_f32 = torch.ldexp(torch.ones_like(exps, dtype=torch.float32), exps - 127)
+    dequant = E2M1_VALUES[codes_l] * scale_f32.repeat_interleave(GROUP_SIZE, dim=1)
+    return packed, scale_u8, dequant
 
 
 def act_fn(x):
