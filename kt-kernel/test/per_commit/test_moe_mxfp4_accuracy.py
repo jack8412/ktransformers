@@ -318,6 +318,39 @@ def test_ue8m0_to_bf16_bitwise():
     assert torch.equal(got.view(torch.int16), ref.view(torch.int16)), "ue8m0->bf16 must be bit-exact for all 256 codes"
 
 
+def test_mxfp4_resident_footprint():
+    """Report and pin the resident cost of one MXFP4 weight matrix.
+
+    Two layouts exist: fp32 group scales (0.625 B/elem) and E8M0 scale bytes
+    (0.53125 B/elem, see the feat/e8m0-resident-scales branch). Assert the
+    binding agrees exactly with the analytic size of whichever this build has,
+    so a layout change shows up here rather than silently.
+    """
+    if not hasattr(kt_kernel_ext.moe, "mxfp4_buffer_bytes"):
+        pytest.skip("mxfp4_buffer_bytes not available (non-AVX512 build)")
+
+    K3_HIDDEN, K3_INTER = 3584, 3072  # Kimi-K3 routed-expert dims
+    per_elem_seen = set()
+    for n, k in ((K3_INTER, K3_HIDDEN), (K3_HIDDEN, K3_INTER)):
+        got = kt_kernel_ext.moe.mxfp4_buffer_bytes(n, k, group_size)
+        weights = n * k // 2
+        candidates = {
+            "fp32-scale": weights + 4 * n * (k // group_size),
+            "e8m0-scale": weights + n * (k // group_size),
+        }
+        match = [name for name, size in candidates.items() if got == size]
+        assert match, f"{n}x{k}: {got} matches neither layout {candidates}"
+        per_elem_seen.add((match[0], round(got / (n * k), 5)))
+
+    assert len(per_elem_seen) == 1, f"gate/up and down disagree on layout: {per_elem_seen}"
+    layout, per_elem = per_elem_seen.pop()
+
+    # Projected full-model expert footprint: 92 MoE layers x 896 experts.
+    params = 92 * 896 * (2 * K3_INTER * K3_HIDDEN + K3_HIDDEN * K3_INTER)
+    assert params == 2722740830208
+    print(f"  layout={layout}  {per_elem} B/elem  K3 full-set={params * per_elem / 1e12:.3f} TB")
+
+
 def test_e2m1_lut_tables_match_spec():
     lut_bits = torch.tensor([(hi << 8) | lo for lo, hi in zip(FP4_BF16_LO, FP4_BF16_HI)], dtype=torch.int32)
     lut_vals = lut_bits.to(torch.int16).view(torch.bfloat16)
@@ -716,6 +749,7 @@ def test_mxfp4_group_size_guard():
 if __name__ == "__main__":
     tests = [
         test_ue8m0_to_bf16_bitwise,
+        test_mxfp4_resident_footprint,
         test_e2m1_lut_tables_match_spec,
         test_mxfp4_accuracy,
         test_mxfp4_situ_accuracy,

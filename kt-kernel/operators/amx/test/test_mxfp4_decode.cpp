@@ -1,6 +1,7 @@
 // Bitwise exactness test for the MXFP4 E2M1 -> BF16 PSHUFB decode used by
 // GemmKernel224MXFP4SmallKGroup. Exhaustively sweeps every packed byte value
 // in every lane position and compares against an independent scalar reference.
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <random>
@@ -55,5 +56,37 @@ int main() {
     }
   }
   printf("PASS: mxfp4_to_bf16_32 bitwise-exact over %ld decoded values\n", checked);
+
+  // --- E8M0 scale expansion: all 256 codes ---
+  // The resident layout may store scales as fp32 (widened at load) or as raw
+  // E8M0 bytes expanded at use; either way the fp32 value a k-group is scaled
+  // by must be identical. Pin every route against each other and against ldexp,
+  // so a future storage change cannot silently rescale whole k-groups.
+  int scale_bad = 0;
+  for (int code = 0; code < 256; code++) {
+    float got = e8m0_to_fp32((uint8_t)code);
+    uint32_t got_bits;
+    std::memcpy(&got_bits, &got, 4);
+
+    // Load-time route: bf16 bits (code << 7) widened to fp32 by << 16.
+    uint32_t via_bf16_bits = (uint32_t)((uint16_t)code << 7) << 16;
+    // Independent reference: 2^(code-127) for normal codes.
+    uint32_t ref_bits;
+    if (code == 0) {
+      ref_bits = 0;  // 2^-127 is below fp32 normals; the repo flushes to +0.0
+    } else {
+      float ref = std::ldexp(1.0f, code - 127);
+      std::memcpy(&ref_bits, &ref, 4);
+    }
+    uint32_t bf_widened = (uint32_t)e8m0_to_bf16((uint8_t)code).bits << 16;
+
+    if (got_bits != via_bf16_bits || got_bits != ref_bits || bf_widened != got_bits) {
+      printf("FAIL e8m0 code=%d: use-time=0x%08x load-time=0x%08x ref=0x%08x bf16<<16=0x%08x\n", code, got_bits,
+             via_bf16_bits, ref_bits, bf_widened);
+      if (++scale_bad > 4) return 1;
+    }
+  }
+  if (scale_bad) return 1;
+  printf("PASS: e8m0_to_fp32/e8m0_to_bf16 exact for all 256 codes (code 0 -> +0.0, 255 -> +inf)\n");
   return 0;
 }

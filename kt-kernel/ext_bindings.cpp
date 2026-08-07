@@ -839,6 +839,16 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
   bind_moe_module<AMX_FP8_MOE_TP<amx::GemmKernel224FP8>>(moe_module, "AMXFP8_MOE");
   bind_moe_module<AMX_FP8_PERCHANNEL_MOE_TP<amx::GemmKernel224FP8PerChannel>>(moe_module, "AMXFP8PerChannel_MOE");
   bind_moe_module<AMX_FP4_MOE_TP<amx::GemmKernel224MXFP4SmallKGroup>>(moe_module, "AMXFP4_KGroup_MOE");
+  // Exact resident bytes for one MXFP4 weight matrix (packed nibbles + group
+  // scales), so tests can assert the footprint instead of sampling RSS.
+  // Queries whichever BufferB the MXFP4 kernel is built with, so it reports the
+  // truth for both the fp32-scale and E8M0-scale layouts.
+  moe_module.def(
+      "mxfp4_buffer_bytes",
+      [](int n, int k, int group_size) {
+        return amx::GemmKernel224MXFP4SmallKGroup::BufferB::required_size(n, k, group_size);
+      },
+      py::arg("n"), py::arg("k"), py::arg("group_size"));
   bind_moe_module<AMX_MXFP8_MOE_TP<amx::GemmKernel224MXFP8SmallKGroup>>(moe_module, "AMXMXFP8_KGroup_MOE");
 #endif
 #if defined(__AVX512BF16__)

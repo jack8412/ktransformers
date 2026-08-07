@@ -450,6 +450,33 @@ inline void init_ggml() {
   inited = true;
 }
 
+// OCP MX E8M0 exponent code -> fp32. value = 2^(code - 127), and the fp32
+// exponent field *is* the code, so this is pure bit placement (no arithmetic).
+//
+// Matches every other ue8m0 conversion in the tree bit-for-bit across all 256
+// codes, which is what lets MXFP4 keep scales resident as raw bytes without
+// moving a single output bit:
+//   loader.py `_ue8m0_to_bf16` yields bf16 bits (code << 7); widening bf16 to
+//   fp32 is a 16-bit shift, giving fp32 bits (code << 23) — identical to this.
+//   `AMX_MXFP8_MOE_TP::convert_ue8m0_to_fp32` already uses (code << 23) too.
+// Edge codes follow that existing behaviour deliberately:
+//   code 0   -> +0.0  (true value 2^-127 is below the fp32 normal range)
+//   code 255 -> +inf  (OCP designates this NaN; kt-kernel has always made +inf)
+inline float e8m0_to_fp32(uint8_t code) {
+  uint32_t bits = static_cast<uint32_t>(code) << 23;
+  float out;
+  std::memcpy(&out, &bits, sizeof(out));
+  return out;
+}
+
+// E8M0 code -> bf16, for the GPU write-back path whose buffer contract is bf16.
+// bf16 shares the fp32 exponent field, so this is the same placement shifted.
+inline ggml_bf16_t e8m0_to_bf16(uint8_t code) {
+  ggml_bf16_t out;
+  out.bits = static_cast<uint16_t>(static_cast<uint16_t>(code) << 7);
+  return out;
+}
+
 template <typename A, typename B>
 void convert_or_copy(A* dst, const B* src, size_t count) {
   if constexpr (std::is_same_v<A, B>) {
