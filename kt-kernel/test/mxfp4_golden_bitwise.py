@@ -171,14 +171,28 @@ def collect(use_u8, perturb_scale=False):
     gen = torch.Generator().manual_seed(SEED)
     data = make_weights(gen)
     if perturb_scale:
-        # Bump ONE scale exponent by one step, in both storage forms.
-        for suffix, tweak in (("_u8", lambda t: t.add_(1)), ("_bf16", lambda t: None)):
-            t = data["gate" + suffix][0]
+        # Anti-vacuity probe: the perturbed run is SEPARATE from the golden
+        # run, so the perturbation only needs to be unmissable, not minimal.
+        #
+        # A single 1-step scale bump is NOT reliably visible in the bf16
+        # output at qlen=1: any one k-group is 32 of 3072/3584 inputs (~1%),
+        # so a x2 change lands near/below bf16's 2^-8 resolution and comes
+        # down to per-element rounding luck (observed 2026-08-07: 6/16 then
+        # 8/16 false-insensitive q1 cases for gate- and single-down-group
+        # perturbations respectively — the gate variant reached 3584 output
+        # rounding lotteries, the single down group exactly one).
+        #
+        # Instead scale expert 0's ENTIRE first down row by 2 steps (x4):
+        # output element 0's expert-0 contribution quadruples, a double-digit
+        # relative change for every backend/activation/qlen/load-path case,
+        # while still proving the full scale path load -> kernel -> output.
+        for suffix in ("_u8", "_bf16"):
+            t = data["down" + suffix][0]
             if suffix == "_u8":
-                t[0, 0] = int(t[0, 0].item()) + 1
+                t[0, :] = (t[0, :].to(torch.int64) + 2).to(torch.uint8)
             else:
                 bits = t.view(torch.int16)
-                bits[0, 0] = bits[0, 0] + (1 << 7)
+                bits[0, :] = bits[0, :] + (2 << 7)
     results = {}
     for name, cls in backends():
         for situ in (None, SITU):
