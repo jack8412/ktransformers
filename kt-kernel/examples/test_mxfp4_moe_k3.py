@@ -12,9 +12,9 @@ reference built from the exactly-dequantized weights:
   2. GEMM K-edge shapes: K multiples of 32 that are not multiples of 64/128,
   3. a threading / NUMA smoke test at 96 threads over 2 pools.
 
-Note: real Kimi-K3 uses the "situ" activation (beta*tanh(g/beta)*sigmoid(g)*up,
-beta=4.0); kt-kernel currently implements SiLU only, so this script tests SiLU.
-SiTU support is a planned follow-up.
+Both activations are covered: plain SiLU and the Kimi-K3 "situ" activation
+(beta*tanh(g/beta)*sigmoid(g) * linear_beta*tanh(up/linear_beta), with
+activation_situ_beta=4.0 and activation_situ_linear_beta=25.0 from the K3 config).
 
 Usage:
     python examples/test_mxfp4_moe_k3.py                 # correctness sweeps
@@ -52,6 +52,10 @@ E2M1_VALUES = torch.tensor(
 
 THRESHOLD = 0.05  # rel-L1 vs dequantized-weight reference (compute-path noise only)
 
+# Kimi-K3 config: activation_situ_beta / activation_situ_linear_beta.
+SITU_BETA = 4.0
+SITU_LINEAR_BETA = 25.0
+
 
 def pick_backend():
     forced = os.getenv("KT_MXFP4_BACKEND", "").strip().lower()
@@ -80,13 +84,26 @@ def act_fn(x):
     return x / (1.0 + torch.exp(-x))
 
 
-def mlp_torch(input_data, gate_proj, up_proj, down_proj):
+def situ_act(gate, up, beta, linear_beta):
+    """Reference SituAndMul from Kimi-K3 modeling_kimi_linear.py."""
+    situ_a = beta * torch.tanh(gate / beta) * torch.sigmoid(gate)
+    if linear_beta:
+        up = linear_beta * torch.tanh(up / linear_beta)
+    return situ_a * up
+
+
+def mlp_torch(input_data, gate_proj, up_proj, down_proj, situ=None):
     gate_buf = torch.mm(input_data, gate_proj.t())
     up_buf = torch.mm(input_data, up_proj.t())
-    return torch.mm(act_fn(gate_buf) * up_buf, down_proj.t())
+    if situ is None:
+        inter = act_fn(gate_buf) * up_buf
+    else:
+        # The kernel rounds the activation result to bf16 before the down GEMM.
+        inter = situ_act(gate_buf, up_buf, *situ).to(torch.bfloat16).float()
+    return torch.mm(inter, down_proj.t())
 
 
-def moe_torch(input_data, expert_ids, weights, gate_proj, up_proj, down_proj, expert_num):
+def moe_torch(input_data, expert_ids, weights, gate_proj, up_proj, down_proj, expert_num, situ=None):
     cnts = expert_ids.new_zeros((expert_ids.shape[0], expert_num))
     cnts.scatter_(1, expert_ids, 1)
     tokens_per_expert = cnts.sum(dim=0)
@@ -98,7 +115,7 @@ def moe_torch(input_data, expert_ids, weights, gate_proj, up_proj, down_proj, ex
         end_idx = start_idx + num_tokens
         if num_tokens == 0:
             continue
-        outputs.append(mlp_torch(sorted_tokens[start_idx:end_idx], gate_proj[i], up_proj[i], down_proj[i]))
+        outputs.append(mlp_torch(sorted_tokens[start_idx:end_idx], gate_proj[i], up_proj[i], down_proj[i], situ=situ))
         start_idx = end_idx
     outs = torch.cat(outputs, dim=0) if outputs else sorted_tokens.new_empty(0)
     new_x = torch.empty_like(outs)
@@ -106,10 +123,12 @@ def moe_torch(input_data, expert_ids, weights, gate_proj, up_proj, down_proj, ex
     return (new_x.view(*expert_ids.shape, -1).float().mul_(weights.unsqueeze(-1)).sum(1)).to(new_x.dtype)
 
 
-def build_moe(backend_cls, cpu_infer, expert_num, top_k, hidden, inter, weights, max_len):
+def build_moe(backend_cls, cpu_infer, expert_num, top_k, hidden, inter, weights, max_len, situ=None):
     cfg = kt_kernel_ext.moe.MOEConfig(expert_num, top_k, hidden, inter, 0)
     cfg.max_len = max_len
     cfg.pool = cpu_infer.backend_
+    if situ is not None:
+        cfg.situ_beta, cfg.situ_linear_beta = situ[0], (situ[1] or 0.0)
     cfg.quant_config.bits = 4
     cfg.quant_config.group_size = GROUP_SIZE
     cfg.quant_config.zero_point = False
@@ -175,20 +194,25 @@ def run_k3_expert_forward(backend_name, backend_cls, threads):
     t0 = time.time()
     data, deq = build_weights(EXPERT_NUM, HIDDEN, INTER, gen)
     print(f"  weights synthesized in {time.time()-t0:.1f}s")
-    moe = build_moe(backend_cls, cpu_infer, EXPERT_NUM, TOP_K, HIDDEN, INTER, data, max_len=4096)
 
-    # qlen 1/4 -> mat-vec; qlen 16/64 -> qlen > 4*E/topk (= 8) mat-mat path.
     failed = False
-    for qlen in (1, 4, 16, 64):
-        expert_ids = torch.stack([torch.randperm(EXPERT_NUM, generator=gen)[:TOP_K] for _ in range(qlen)]).contiguous()
-        weights = torch.rand((qlen, TOP_K), dtype=torch.float32, generator=gen).contiguous()
-        x = (torch.randn((qlen, HIDDEN), dtype=torch.float32, generator=gen) / 10.0).to(torch.bfloat16).contiguous()
-        y = forward(moe, cpu_infer, qlen, TOP_K, HIDDEN, expert_ids, weights, x)
-        ref = moe_torch(x.float(), expert_ids, weights, deq["gate"], deq["up"], deq["down"], EXPERT_NUM).to(torch.bfloat16)
-        diff = rel_l1(y, ref)
-        status = "OK " if diff < THRESHOLD else "FAIL"
-        print(f"  qlen={qlen:>3}  rel-L1={diff:.6f}  [{status}]")
-        failed |= diff >= THRESHOLD
+    # K3 serves with situ; silu is kept as the regression baseline.
+    for label, situ in (("silu", None), (f"situ(beta={SITU_BETA},lin={SITU_LINEAR_BETA})", (SITU_BETA, SITU_LINEAR_BETA))):
+        moe = build_moe(backend_cls, cpu_infer, EXPERT_NUM, TOP_K, HIDDEN, INTER, data, max_len=4096, situ=situ)
+        # qlen 1/4 -> mat-vec; qlen 16/64 -> qlen > 4*E/topk (= 8) mat-mat path.
+        for qlen in (1, 4, 16, 64):
+            expert_ids = torch.stack([torch.randperm(EXPERT_NUM, generator=gen)[:TOP_K] for _ in range(qlen)]).contiguous()
+            weights = torch.rand((qlen, TOP_K), dtype=torch.float32, generator=gen).contiguous()
+            x = (torch.randn((qlen, HIDDEN), dtype=torch.float32, generator=gen) / 10.0).to(torch.bfloat16).contiguous()
+            y = forward(moe, cpu_infer, qlen, TOP_K, HIDDEN, expert_ids, weights, x)
+            ref = moe_torch(
+                x.float(), expert_ids, weights, deq["gate"], deq["up"], deq["down"], EXPERT_NUM, situ=situ
+            ).to(torch.bfloat16)
+            diff = rel_l1(y, ref)
+            status = "OK " if diff < THRESHOLD else "FAIL"
+            print(f"  {label:<28} qlen={qlen:>3}  rel-L1={diff:.6f}  [{status}]")
+            failed |= diff >= THRESHOLD
+        del moe
     return not failed
 
 

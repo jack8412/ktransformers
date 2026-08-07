@@ -150,14 +150,27 @@ def act_fn(x):
     return x / (1.0 + torch.exp(-x))
 
 
-def mlp_torch(input_data, gate_proj, up_proj, down_proj):
+def situ_act(gate, up, beta, linear_beta):
+    """Reference SituAndMul (Kimi-K3 modeling_kimi_linear.py):
+    beta*tanh(gate/beta)*sigmoid(gate) * up, with up squashed by linear_beta."""
+    situ_a = beta * torch.tanh(gate / beta) * torch.sigmoid(gate)
+    if linear_beta:
+        up = linear_beta * torch.tanh(up / linear_beta)
+    return situ_a * up
+
+
+def mlp_torch(input_data, gate_proj, up_proj, down_proj, situ=None):
     gate_buf = torch.mm(input_data, gate_proj.t())
     up_buf = torch.mm(input_data, up_proj.t())
-    intermediate = act_fn(gate_buf) * up_buf
+    if situ is None:
+        intermediate = act_fn(gate_buf) * up_buf
+    else:
+        # The kernel rounds the activation output to bf16 before the down GEMM.
+        intermediate = situ_act(gate_buf, up_buf, *situ).to(torch.bfloat16).float()
     return torch.mm(intermediate, down_proj.t())
 
 
-def moe_torch(input_data, expert_ids, weights, gate_proj, up_proj, down_proj):
+def moe_torch(input_data, expert_ids, weights, gate_proj, up_proj, down_proj, situ=None):
     cnts = expert_ids.new_zeros((expert_ids.shape[0], expert_num))
     cnts.scatter_(1, expert_ids, 1)
     tokens_per_expert = cnts.sum(dim=0)
@@ -170,7 +183,7 @@ def moe_torch(input_data, expert_ids, weights, gate_proj, up_proj, down_proj):
         if num_tokens == 0:
             continue
         tokens = sorted_tokens[start_idx:end_idx]
-        out = mlp_torch(tokens, gate_proj[i], up_proj[i], down_proj[i])
+        out = mlp_torch(tokens, gate_proj[i], up_proj[i], down_proj[i], situ=situ)
         outputs.append(out)
         start_idx = end_idx
     outs = torch.cat(outputs, dim=0) if outputs else sorted_tokens.new_empty(0)
@@ -320,12 +333,16 @@ def test_e2m1_lut_tables_match_spec():
 # ---------------------------------------------------------------------------
 
 
-def run_backend_accuracy_test(backend_name, backend_cls, threshold, qlen, hidden=hidden_size, inter=intermediate_size):
+def run_backend_accuracy_test(
+    backend_name, backend_cls, threshold, qlen, hidden=hidden_size, inter=intermediate_size, situ=None
+):
     cpu_infer = make_cpu_infer()
     with torch.inference_mode():
         data = make_mxfp4_experts(seed=42 + qlen, hidden=hidden, inter=inter)
         config, keepalive = build_flat_config(data, hidden=hidden, inter=inter, qlen_max=max(max_len, qlen))
         config.pool = cpu_infer.backend_
+        if situ is not None:
+            config.situ_beta, config.situ_linear_beta = situ[0], (situ[1] or 0.0)
 
         gen = torch.Generator().manual_seed(1234 + qlen)
         print(f"\n--- {backend_name} (qlen={qlen}, hidden={hidden}, inter={inter}) ---")
@@ -353,7 +370,13 @@ def run_backend_accuracy_test(backend_name, backend_cls, threshold, qlen, hidden
             cpu_infer.sync()
 
             ref_output = moe_torch(
-                input_data.float(), expert_ids, weights, data["dequant"]["gate"], data["dequant"]["up"], data["dequant"]["down"]
+                input_data.float(),
+                expert_ids,
+                weights,
+                data["dequant"]["gate"],
+                data["dequant"]["up"],
+                data["dequant"]["down"],
+                situ=situ,
             ).to(torch.bfloat16)
             diff = torch.mean(torch.abs(output.float() - ref_output.float())) / (
                 torch.mean(torch.abs(ref_output.float())) + 1e-8
@@ -377,6 +400,88 @@ def test_mxfp4_accuracy():
         # k-group and N blocking edges (inter=192 stays 32-aligned after the
         # 2-way NUMA TP split used by make_cpu_infer).
         run_backend_accuracy_test(backend_name, backend_cls, threshold, qlen=32, hidden=160, inter=192)
+
+
+def test_mxfp4_situ_accuracy():
+    """Kimi-K3 'situ' activation: beta*tanh(g/beta)*sigmoid(g) * linear_beta*tanh(u/linear_beta)."""
+    backends = available_backends()
+    if not backends:
+        pytest.skip("no MXFP4 backend available")
+
+    # K3: activation_situ_beta=4.0, activation_situ_linear_beta=25.0.
+    for backend_name, backend_cls, threshold in backends:
+        for situ in ((4.0, 25.0), (4.0, None), (1.0, 25.0)):
+            for qlen in (1, 32):
+                run_backend_accuracy_test(
+                    f"{backend_name} situ{situ}", backend_cls, threshold, qlen=qlen, situ=situ
+                )
+
+
+def test_situ_differs_from_silu():
+    """Guard against the config field being silently ignored: with the same
+    weights, situ output must differ from the silu output, and must match its
+    own reference (which the accuracy test above checks)."""
+    backends = available_backends()
+    if not backends:
+        pytest.skip("no MXFP4 backend available")
+    _, backend_cls, _ = backends[0]
+
+    cpu_infer = make_cpu_infer()
+    gen = torch.Generator().manual_seed(21)
+    qlen = 8
+    expert_ids, weights = make_routing(qlen, gen)
+    input_data = (torch.randn((qlen, hidden_size), dtype=torch.float32, generator=gen) / 10.0).to(torch.bfloat16).contiguous()
+    data = make_mxfp4_experts(seed=21)
+
+    outs = {}
+    for tag, situ in (("silu", None), ("situ", (4.0, 25.0))):
+        config, keepalive = build_flat_config(data)
+        config.pool = cpu_infer.backend_
+        if situ is not None:
+            config.situ_beta, config.situ_linear_beta = situ
+        outs[tag] = load_and_forward(backend_cls, config, cpu_infer, qlen, expert_ids, weights, input_data)
+        del keepalive
+
+    assert torch.isfinite(outs["situ"].float()).all(), "situ produced non-finite output"
+    assert not torch.equal(outs["silu"], outs["situ"]), "situ_beta had no effect — config field ignored?"
+
+
+def test_situ_rejected_for_silu_only_backends():
+    """LLAMAFILE / MOE_INT* have a hard-coded scalar silu epilogue that never
+    reads situ_beta; the factory must refuse instead of serving wrong math."""
+    load_amx_utils()
+    import importlib.util
+
+    pkg_root = KT_KERNEL_ROOT / "python"
+    spec = importlib.util.spec_from_file_location("kt_kernel.experts", pkg_root / "experts.py")
+    experts_mod = importlib.util.module_from_spec(spec)
+    sys.modules["kt_kernel.experts"] = experts_mod
+    spec.loader.exec_module(experts_mod)
+
+    common = dict(
+        layer_idx=0,
+        num_experts=expert_num,
+        num_experts_per_tok=num_experts_per_tok,
+        hidden_size=hidden_size,
+        moe_intermediate_size=intermediate_size,
+        gpu_experts_mask=None,
+        cpuinfer_threads=CPUINFER_PARAM,
+        threadpool_count=1,
+        weight_path="/nonexistent",
+        chunked_prefill_size=max_len,
+    )
+    for bad_method in ("LLAMAFILE", "MOE_INT4", "MOE_INT8"):
+        with pytest.raises(ValueError, match="situ_beta"):
+            experts_mod.KTMoEWrapper(method=bad_method, situ_beta=4.0, situ_linear_beta=25.0, **common)
+    # linear_beta without beta is a config error, not a silent no-op.
+    with pytest.raises(ValueError, match="requires situ_beta"):
+        experts_mod.KTMoEWrapper(method="MXFP4", situ_beta=0.0, situ_linear_beta=25.0, **common)
+    # situ + swiglu clamp would silently drop the clamp.
+    with pytest.raises(ValueError, match="cannot be combined"):
+        experts_mod.KTMoEWrapper(method="MXFP4", situ_beta=4.0, swiglu_limit=10.0, **common)
+    # SFT backends have their own epilogue.
+    with pytest.raises(ValueError, match="situ_beta"):
+        experts_mod.KTMoEWrapper(method="AMXBF16_SFT", mode="sft", situ_beta=4.0, **common)
 
 
 # ---------------------------------------------------------------------------
@@ -606,6 +711,9 @@ if __name__ == "__main__":
         test_ue8m0_to_bf16_bitwise,
         test_e2m1_lut_tables_match_spec,
         test_mxfp4_accuracy,
+        test_mxfp4_situ_accuracy,
+        test_situ_differs_from_silu,
+        test_situ_rejected_for_silu_only_backends,
         test_k3_naming_loader,
         test_v4_naming_loader,
         test_v4_k3_flat_forward_equivalence,
