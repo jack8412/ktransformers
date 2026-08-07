@@ -269,6 +269,8 @@ class AMXMoEWrapper(BaseMoEWrapper):
         max_deferred_experts_per_token: Optional[int] = None,
         method: str = "AMXINT4",
         numa_nodes: Optional[List[int]] = None,
+        situ_beta: float = 0.0,
+        situ_linear_beta: float = 0.0,
     ):
         """
         Initialize AMX MoE Wrapper.
@@ -320,6 +322,8 @@ class AMXMoEWrapper(BaseMoEWrapper):
             max_deferred_experts_per_token=max_deferred_experts_per_token,
             method=method,
             numa_nodes=numa_nodes,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
         )
 
         # AMX-specific: Check if we should load merged safetensor weights
@@ -375,6 +379,8 @@ class AMXMoEWrapper(BaseMoEWrapper):
         moe_config.layer_idx = self.layer_idx
         moe_config.pool = self.cpu_infer.backend_
         moe_config.max_len = self.chunked_prefill_size
+        moe_config.situ_beta = self.situ_beta
+        moe_config.situ_linear_beta = self.situ_linear_beta
 
         # Enable save mode for online quantization
         moe_config.save = True
@@ -490,6 +496,8 @@ class AMXMoEWrapper(BaseMoEWrapper):
         moe_config.layer_idx = self.layer_idx
         moe_config.pool = self.cpu_infer.backend_
         moe_config.max_len = self.chunked_prefill_size
+        moe_config.situ_beta = self.situ_beta
+        moe_config.situ_linear_beta = self.situ_linear_beta
 
         moe_config.gate_proj = gate_ptr
         moe_config.up_proj = up_ptr
@@ -569,6 +577,8 @@ class NativeMoEWrapper(BaseMoEWrapper):
         numa_nodes: Optional[List[int]] = None,
         swiglu_limit: float = 0.0,
         swiglu_alpha: float = 0.0,
+        situ_beta: float = 0.0,
+        situ_linear_beta: float = 0.0,
     ):
         self._swiglu_alpha = float(swiglu_alpha)
         # Kept for load-time TP-slicing validation (BaseMoEWrapper does not store it).
@@ -654,6 +664,8 @@ class NativeMoEWrapper(BaseMoEWrapper):
             method=method,
             numa_nodes=numa_nodes,
             swiglu_limit=swiglu_limit,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
         )
 
         if NativeMoEWrapper._native_loader_instance is None:
@@ -841,6 +853,11 @@ class NativeMoEWrapper(BaseMoEWrapper):
                 f"only valid for MXFP4/MXFP8."
             )
         moe_config.swiglu_limit = self.swiglu_limit
+        # Kimi-K3 situ activation (0.0 = disabled). Consumed by amx::act_fn /
+        # avx2::act_fn via apply_activation; the factory in experts.py rejects
+        # it for backends that hard-code silu.
+        moe_config.situ_beta = self.situ_beta
+        moe_config.situ_linear_beta = self.situ_linear_beta
 
         # Use gate_projs instead of gate_proj for per-expert pointers
         moe_config.gate_projs = gate_ptrs

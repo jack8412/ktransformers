@@ -324,6 +324,18 @@ struct GeneralMOEConfig {
   // both gate and up (±swiglu_limit). 0.0f = disabled (standard silu path).
   float swiglu_alpha = 0.0f;
 
+  // Kimi-K3 "situ" activation (config hidden_act="situ"):
+  //   situ(gate) = beta * tanh(gate / beta) * sigmoid(gate)
+  //   out        = situ(gate) * up
+  // When situ_linear_beta > 0 the up branch is squashed too, matching the
+  // reference SituAndMul(linear_beta=...):
+  //   up = situ_linear_beta * tanh(up / situ_linear_beta)
+  // K3 uses beta=4.0 (activation_situ_beta) and linear_beta=25.0
+  // (activation_situ_linear_beta). 0.0f = disabled (standard silu path).
+  // Takes precedence over swiglu_alpha/swiglu_limit, which K3 does not use.
+  float situ_beta = 0.0f;
+  float situ_linear_beta = 0.0f;
+
   GeneralMOEConfig() {}
 
   GeneralMOEConfig(int expert_num, int routed_expert_num, int hidden_size, int intermediate_size)

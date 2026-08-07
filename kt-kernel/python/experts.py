@@ -155,6 +155,13 @@ class KTMoEWrapper:
         # MiniMax M3 swigluoai sigmoid alpha. 0.0 = standard silu (default).
         # Non-zero triggers gate * sigmoid(gate * alpha) * (up + 1) in act_fn.
         swiglu_alpha: float = 0.0,
+        # Kimi-K3 "situ" activation (config hidden_act="situ"):
+        #   beta * tanh(gate/beta) * sigmoid(gate) * up,
+        #   with up = linear_beta * tanh(up/linear_beta) when linear_beta > 0.
+        # K3 sets beta=4.0 (activation_situ_beta) and linear_beta=25.0
+        # (activation_situ_linear_beta). 0.0 = disabled (standard silu).
+        situ_beta: float = 0.0,
+        situ_linear_beta: float = 0.0,
     ):
         """
         Factory method to create the appropriate backend implementation.
@@ -227,6 +234,8 @@ class KTMoEWrapper:
                 numa_nodes=numa_nodes,
                 swiglu_limit=swiglu_limit,
                 swiglu_alpha=swiglu_alpha,
+                situ_beta=situ_beta,
+                situ_linear_beta=situ_linear_beta,
             )
         else:  # mode == "sft"
             # SFT factory does not plumb swiglu_limit; reject non-zero
@@ -236,6 +245,15 @@ class KTMoEWrapper:
                     f"swiglu_limit={swiglu_limit} is not supported in "
                     f"mode='sft' (method={method!r}); SFT backends do not "
                     f"implement the V4-2604B clamp."
+                )
+            # SFT kernels have their own activation epilogue (amx/sft_moe.hpp)
+            # that does not read situ_beta; reject rather than silently
+            # training/serving with plain silu.
+            if situ_beta != 0.0 or situ_linear_beta != 0.0:
+                raise ValueError(
+                    f"situ_beta={situ_beta}/situ_linear_beta={situ_linear_beta} is not "
+                    f"supported in mode='sft' (method={method!r}); SFT backends do not "
+                    f"implement the Kimi-K3 situ activation."
                 )
             return _create_sft_wrapper(
                 layer_idx=layer_idx,
@@ -326,6 +344,8 @@ def _create_inference_wrapper(
     numa_nodes: Optional[List[int]] = None,
     swiglu_limit: float = 0.0,
     swiglu_alpha: float = 0.0,
+    situ_beta: float = 0.0,
+    situ_linear_beta: float = 0.0,
 ) -> BaseMoEWrapper:
     """
     Create an inference wrapper based on the method.
@@ -365,7 +385,35 @@ def _create_inference_wrapper(
     # 10.0 (e.g., from a leftover SGLANG_DSV4_2604_SUBMODE=2604B in the env)
     # into a non-MXFP4 backend; act_fn would then clamp gate/up to ±10 with
     # no warning. Gate strictly on method instead. Origin: kt-sglang 耦合.
+    # The situ epilogue lives in amx::act_fn / avx2::act_fn, reached only via
+    # the AMX_MOE_BASE / AVX2_MOE_BASE apply_activation used by the AMX and
+    # Native backends. LLAMAFILE (llamafile/moe.hpp) and MOE_INT4/MOE_INT8
+    # (moe_kernel/moe.hpp) have their own hard-coded scalar silu and would
+    # ignore situ_beta silently, so reject it there.
+    if situ_beta != 0.0 or situ_linear_beta != 0.0:
+        if backend_cls in (LlamafileMoEWrapper, GeneralMoEWrapper):
+            raise ValueError(
+                f"situ_beta={situ_beta} is not supported by method={method!r} "
+                f"(backend={backend_cls.__name__}): that backend applies a hard-coded "
+                f"silu epilogue. Use an AMX/Native method (e.g. MXFP4) for Kimi-K3."
+            )
+        if situ_beta <= 0.0:
+            raise ValueError(
+                f"situ_linear_beta={situ_linear_beta} requires situ_beta > 0 "
+                f"(got situ_beta={situ_beta}); the up-branch squash is only applied "
+                f"on the situ path."
+            )
+        if swiglu_limit != 0.0 or swiglu_alpha != 0.0:
+            raise ValueError(
+                f"situ_beta={situ_beta} cannot be combined with "
+                f"swiglu_limit={swiglu_limit}/swiglu_alpha={swiglu_alpha}: act_fn takes "
+                f"the situ branch and would silently ignore them."
+            )
+
     extra_kwargs = {}
+    if situ_beta != 0.0:
+        extra_kwargs["situ_beta"] = situ_beta
+        extra_kwargs["situ_linear_beta"] = situ_linear_beta
     if method in ("MXFP4", "MXFP8"):
         extra_kwargs["swiglu_limit"] = swiglu_limit
         extra_kwargs["swiglu_alpha"] = swiglu_alpha

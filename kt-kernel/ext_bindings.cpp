@@ -797,6 +797,9 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
       // V4-Flash 2604B SwiGLU clamp limit (0.0 = disabled). See common.hpp.
       .def_readwrite("swiglu_limit", &GeneralMOEConfig::swiglu_limit)
       .def_readwrite("swiglu_alpha", &GeneralMOEConfig::swiglu_alpha)
+      // Kimi-K3 "situ" activation params (0.0 = disabled). See common.hpp.
+      .def_readwrite("situ_beta", &GeneralMOEConfig::situ_beta)
+      .def_readwrite("situ_linear_beta", &GeneralMOEConfig::situ_linear_beta)
 
       ;
 

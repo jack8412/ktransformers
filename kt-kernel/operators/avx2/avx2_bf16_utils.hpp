@@ -115,6 +115,24 @@ static inline __m256 exp_avx2(__m256 x) {
 // AVX2 port of amx::act_fn
 // ============================================================================
 
+// AVX2 port of amx::tanh_avx512 — see that function for why small |x| uses the
+// Taylor series instead of the exp form.
+static inline __m256 tanh_avx2(__m256 x) {
+  const __m256 x2 = _mm256_mul_ps(x, x);
+  __m256 poly = _mm256_fmadd_ps(x2, _mm256_set1_ps(-17.0f / 315.0f), _mm256_set1_ps(2.0f / 15.0f));
+  poly = _mm256_fmadd_ps(x2, poly, _mm256_set1_ps(-1.0f / 3.0f));
+  poly = _mm256_fmadd_ps(_mm256_mul_ps(x2, poly), x, x);  // x + x^3*(-1/3 + 2/15*x^2 - 17/315*x^4)
+
+  __m256 two_x = _mm256_add_ps(x, x);
+  two_x = _mm256_min_ps(_mm256_max_ps(two_x, _mm256_set1_ps(-88.0f)), _mm256_set1_ps(88.0f));
+  __m256 denom = _mm256_add_ps(exp_avx2(two_x), _mm256_set1_ps(1.0f));
+  __m256 big = _mm256_sub_ps(_mm256_set1_ps(1.0f), _mm256_div_ps(_mm256_set1_ps(2.0f), denom));
+
+  const __m256 abs_x = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), x);
+  __m256 is_small = _mm256_cmp_ps(abs_x, _mm256_set1_ps(0.25f), _CMP_LT_OQ);
+  return _mm256_blendv_ps(big, poly, is_small);
+}
+
 static inline __m256 act_fn(__m256 gate_val, __m256 up_val) {
   __m256 neg_gate_val = _mm256_sub_ps(_mm256_setzero_ps(), gate_val);
   // Clamp to avoid exp overflow
@@ -166,6 +184,29 @@ static inline __m256 act_fn(__m256 gate_val, __m256 up_val, float swiglu_limit, 
     return _mm256_mul_ps(_mm256_mul_ps(gate_val, sigmoid_val), up_plus_1);
   }
   return act_fn(gate_val, up_val, swiglu_limit);
+}
+
+// Kimi-K3 "situ" activation. Mirrors amx::act_fn(g, u, limit, alpha, beta, linear_beta).
+static inline __m256 act_fn(__m256 gate_val, __m256 up_val, float swiglu_limit, float swiglu_alpha, float situ_beta,
+                            float situ_linear_beta) {
+  if (situ_beta > 0.0f) {
+    const __m256 beta = _mm256_set1_ps(situ_beta);
+    const __m256 inv_beta = _mm256_set1_ps(1.0f / situ_beta);
+
+    __m256 neg_gate = _mm256_sub_ps(_mm256_setzero_ps(), gate_val);
+    neg_gate = _mm256_min_ps(neg_gate, _mm256_set1_ps(88.0f));
+    __m256 sigmoid_val = _mm256_div_ps(_mm256_set1_ps(1.0f), _mm256_add_ps(_mm256_set1_ps(1.0f), exp_avx2(neg_gate)));
+
+    __m256 situ_a = _mm256_mul_ps(_mm256_mul_ps(beta, tanh_avx2(_mm256_mul_ps(gate_val, inv_beta))), sigmoid_val);
+
+    if (situ_linear_beta > 0.0f) {
+      const __m256 lbeta = _mm256_set1_ps(situ_linear_beta);
+      const __m256 inv_lbeta = _mm256_set1_ps(1.0f / situ_linear_beta);
+      up_val = _mm256_mul_ps(lbeta, tanh_avx2(_mm256_mul_ps(up_val, inv_lbeta)));
+    }
+    return _mm256_mul_ps(situ_a, up_val);
+  }
+  return act_fn(gate_val, up_val, swiglu_limit, swiglu_alpha);
 }
 
 }  // namespace avx2

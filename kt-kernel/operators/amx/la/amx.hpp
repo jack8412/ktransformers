@@ -44,6 +44,28 @@ static inline __m512 exp_avx512(__m512 x) {
   return _mm512_mul_ps(two_pow_i, frac_exp);
 }
 
+// tanh for the Kimi-K3 "situ" activation.
+// |x| >= 1/4: tanh(x) = 1 - 2 / (exp(2x) + 1).
+// |x| <  1/4: that form loses significant bits to the 1 - (≈1) cancellation
+// (it costs ~2 bits at the switch point and grows without bound as x -> 0), so
+// use the 7th-order Taylor series there instead; its truncation error at the
+// switch point is ~8e-8 absolute, i.e. below the exp form's own error.
+static inline __m512 tanh_avx512(__m512 x) {
+  const __m512 x2 = _mm512_mul_ps(x, x);
+  __m512 poly = _mm512_fmadd_ps(x2, _mm512_set1_ps(-17.0f / 315.0f), _mm512_set1_ps(2.0f / 15.0f));
+  poly = _mm512_fmadd_ps(x2, poly, _mm512_set1_ps(-1.0f / 3.0f));
+  poly = _mm512_fmadd_ps(_mm512_mul_ps(x2, poly), x, x);  // x + x^3*(-1/3 + 2/15*x^2 - 17/315*x^4)
+
+  // exp(±88) is the finite-float limit; tanh saturates to ±1 far below it.
+  __m512 two_x = _mm512_add_ps(x, x);
+  two_x = _mm512_min_ps(_mm512_max_ps(two_x, _mm512_set1_ps(-88.0f)), _mm512_set1_ps(88.0f));
+  __m512 denom = _mm512_add_ps(exp_avx512(two_x), _mm512_set1_ps(1.0f));
+  __m512 big = _mm512_sub_ps(_mm512_set1_ps(1.0f), _mm512_div_ps(_mm512_set1_ps(2.0f), denom));
+
+  __mmask16 is_small = _mm512_cmp_ps_mask(_mm512_abs_ps(x), _mm512_set1_ps(0.25f), _CMP_LT_OQ);
+  return _mm512_mask_blend_ps(is_small, big, poly);
+}
+
 static inline __m512 act_fn(__m512 gate_val, __m512 up_val, float swiglu_limit = 0.0f) {
   // DeepSeek V4-Flash 2604B asymmetric SwiGLU clamp. swiglu_limit > 0
   // applies the same clamp the trtllm `gemm1_clamp_limit` and the sglang
@@ -98,6 +120,36 @@ static inline __m512 act_fn(__m512 gate_val, __m512 up_val, float swiglu_limit, 
     return _mm512_mul_ps(_mm512_mul_ps(gate_val, sigmoid_val), up_plus_1);
   }
   return act_fn(gate_val, up_val, swiglu_limit);
+}
+
+// Kimi-K3 "situ" + the silu/swigluoai entry point above.
+//   situ_beta > 0 -> beta*tanh(gate/beta)*sigmoid(gate) * up, with
+//                    up = linear_beta*tanh(up/linear_beta) when linear_beta > 0
+//   situ_beta == 0 -> falls back to act_fn(gate, up, swiglu_limit, swiglu_alpha)
+// K3 never sets swiglu_limit/swiglu_alpha, so situ deliberately ignores them
+// (the Python layer rejects the combination rather than silently dropping it).
+static inline __m512 act_fn(__m512 gate_val, __m512 up_val, float swiglu_limit, float swiglu_alpha, float situ_beta,
+                            float situ_linear_beta) {
+  if (situ_beta > 0.0f) {
+    const __m512 beta = _mm512_set1_ps(situ_beta);
+    const __m512 inv_beta = _mm512_set1_ps(1.0f / situ_beta);
+
+    // sigmoid(gate) = 1 / (1 + exp(-gate))
+    __m512 neg_gate = _mm512_sub_ps(_mm512_setzero_ps(), gate_val);
+    neg_gate = _mm512_min_ps(neg_gate, _mm512_set1_ps(88.0f));
+    __m512 sigmoid_val =
+        _mm512_div_ps(_mm512_set1_ps(1.0f), _mm512_add_ps(_mm512_set1_ps(1.0f), exp_avx512(neg_gate)));
+
+    __m512 situ_a = _mm512_mul_ps(_mm512_mul_ps(beta, tanh_avx512(_mm512_mul_ps(gate_val, inv_beta))), sigmoid_val);
+
+    if (situ_linear_beta > 0.0f) {
+      const __m512 lbeta = _mm512_set1_ps(situ_linear_beta);
+      const __m512 inv_lbeta = _mm512_set1_ps(1.0f / situ_linear_beta);
+      up_val = _mm512_mul_ps(lbeta, tanh_avx512(_mm512_mul_ps(up_val, inv_lbeta)));
+    }
+    return _mm512_mul_ps(situ_a, up_val);
+  }
+  return act_fn(gate_val, up_val, swiglu_limit, swiglu_alpha);
 }
 
 #define AMX_DISPATCH_QTYPES(QA, QB, ...)                                 \

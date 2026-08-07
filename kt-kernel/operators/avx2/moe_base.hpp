@@ -552,6 +552,8 @@ class AVX2_MOE_BASE {
       auto [n_start, n_end] = T::split_range_n(config_.intermediate_size, ith, nth);
       const float swiglu_limit = config_.swiglu_limit;
       const float swiglu_alpha = config_.swiglu_alpha;
+      const float situ_beta = config_.situ_beta;
+      const float situ_linear_beta = config_.situ_linear_beta;
       for (int i = 0; i < m_local_num_[expert_idx]; i++) {
         ggml_bf16_t* gate_ptr = &m_local_gate_output_ptr_[expert_idx][i * config_.intermediate_size];
         ggml_bf16_t* up_ptr = &m_local_up_output_ptr_[expert_idx][i * config_.intermediate_size];
@@ -559,14 +561,20 @@ class AVX2_MOE_BASE {
         for (; j + 8 <= n_end; j += 8) {
           __m256 gate_val = avx2::load_bf16_to_fp32(gate_ptr + j);
           __m256 up_val = avx2::load_bf16_to_fp32(up_ptr + j);
-          __m256 result = avx2::act_fn(gate_val, up_val, swiglu_limit, swiglu_alpha);
+          __m256 result = avx2::act_fn(gate_val, up_val, swiglu_limit, swiglu_alpha, situ_beta, situ_linear_beta);
           avx2::store_fp32_to_bf16(gate_ptr + j, result);
         }
-        // Scalar tail — mirror the vectorized swigluoai / silu paths in avx2::act_fn.
+        // Scalar tail — mirror the vectorized situ / swigluoai / silu paths in avx2::act_fn.
         for (; j < n_end; j++) {
           float g = GGML_BF16_TO_FP32(gate_ptr[j]);
           float u = GGML_BF16_TO_FP32(up_ptr[j]);
-          if (swiglu_alpha > 0.0f) {
+          if (situ_beta > 0.0f) {
+            float situ_a = situ_beta * tanhf(g / situ_beta) / (1.0f + expf(-g));
+            if (situ_linear_beta > 0.0f) {
+              u = situ_linear_beta * tanhf(u / situ_linear_beta);
+            }
+            gate_ptr[j] = GGML_FP32_TO_BF16(situ_a * u);
+          } else if (swiglu_alpha > 0.0f) {
             if (swiglu_limit > 0.0f) {
               g = std::min(std::max(g, -swiglu_limit), swiglu_limit);
               u = std::min(std::max(u, -swiglu_limit), swiglu_limit);
