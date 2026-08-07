@@ -1277,8 +1277,13 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
                 (up_name, up_scales),
                 (down_name, down_scales),
             ):
-                s = self.load_tensor(f"{prefix}.{exp_id}.{proj}.{scale_suffix}", device)
-                dst[exp_id] = self._ue8m0_to_bf16(s)
+                s = self.load_tensor(f"{prefix}.{exp_id}.{proj}.{scale_suffix}", device).contiguous()
+                # Keep the ue8m0 codes as raw bytes: the MXFP4 kernels hold them
+                # resident at 1 B/group and expand to fp32 at use time, which is
+                # bit-identical to the old load-time widening but 15% smaller.
+                if s.dtype != torch.uint8:
+                    s = s.view(torch.uint8)
+                dst[exp_id] = s
 
         print(f"[MXFP4SafeTensorLoader] Loaded {expert_count} experts from {prefix} (*.{weight_suffix})")
         return {

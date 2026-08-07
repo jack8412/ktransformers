@@ -55,11 +55,16 @@ def load_loader_cls():
     return mod.MXFP4SafeTensorLoader
 
 
-def dequant_ours(packed, scale_bf16):
+def dequant_ours(packed, scale_u8):
+    """scale_u8 holds raw E8M0 codes (value = 2^(code-127)), matching what the
+    loader now hands the kernels."""
     lo = (packed & 0x0F).to(torch.int64)
     hi = ((packed >> 4) & 0x0F).to(torch.int64)
     codes = torch.stack((lo, hi), dim=-1).view(packed.shape[0], -1)
-    return E2M1_VALUES[codes] * scale_bf16.float().repeat_interleave(GROUP_SIZE, dim=1)
+    e = scale_u8.to(torch.int32)
+    scale_f32 = torch.ldexp(torch.ones_like(e, dtype=torch.float32), e - 127)
+    scale_f32 = torch.where(e == 0, torch.zeros_like(scale_f32), scale_f32)
+    return E2M1_VALUES[codes] * scale_f32.repeat_interleave(GROUP_SIZE, dim=1)
 
 
 def check_compressed_tensors_reference(packed, scale_u8, ours):
@@ -135,9 +140,9 @@ def main():
     wdict = loader.load_experts(f"language_model.model.layers.{args.layer}")
     exp = args.expert
     assert torch.equal(wdict["gate"][exp], tensors["w1.weight_packed"])
-    expect_scale = (tensors["w1.weight_scale"].to(torch.int32) << 7).to(torch.int16).view(torch.bfloat16)
-    assert torch.equal(wdict["gate_scale"][exp].view(torch.int16), expect_scale.view(torch.int16))
-    print("[2] MXFP4SafeTensorLoader: K3 naming resolved, scale conversion exact  [OK]")
+    assert wdict["gate_scale"][exp].dtype == torch.uint8
+    assert torch.equal(wdict["gate_scale"][exp], tensors["w1.weight_scale"])
+    print("[2] MXFP4SafeTensorLoader: K3 naming resolved, ue8m0 bytes passed through  [OK]")
 
     deq = {}
     for proj, w in (("gate", "w1"), ("up", "w3"), ("down", "w2")):

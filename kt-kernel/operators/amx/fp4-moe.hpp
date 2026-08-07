@@ -9,7 +9,7 @@
  *   Weight:   FP4 E2M1 (nibble-packed, same layout) → PSHUFB lookup → BF16
  *   Act:      BF16 direct (BufferABF16Impl, no online INT8 quantization)
  *   Dot prod: _mm512_dpbf16_ps (BF16×BF16→FP32) instead of _mm512_dpbssd_epi32
- *   Scale:    FP32 per-group scale (weight only, no activation scale)
+ *   Scale:    E8M0 per-group byte, resident as-is, expanded to FP32 at use
  **/
 #ifndef CPUINFER_OPERATOR_AMX_FP4_MOE_H
 #define CPUINFER_OPERATOR_AMX_FP4_MOE_H
@@ -18,6 +18,86 @@
 #include "moe_base.hpp"
 
 namespace amx {
+
+// ============================================================================
+// Resident MXFP4 weight buffer: nibble-packed E2M1 + raw E8M0 scale bytes.
+//
+// Deliberately NOT BufferBInt4KGroupImpl (which RAWINT4 uses): RAWINT4's group
+// scales are arbitrary bf16 values that cannot be represented in one byte,
+// while MXFP4's are power-of-two E8M0 codes. Keeping them as 1 B/group and
+// expanding to fp32 in the kernel epilogue costs 0.53125 B/elem resident
+// instead of 0.625 (-15%), and the expansion is exact so outputs are unchanged.
+// ============================================================================
+template <typename K>
+struct BufferBMXFP4KGroupImpl {
+  using dt = typename K::dt;
+  dt* b;       // nibble-packed E2M1 weights, row-major [n, k/2]
+  uint8_t* d;  // E8M0 exponent codes, row-major [n, k/k_group_size]
+  int n, k, k_group_size, k_group_count;
+
+  static constexpr int N_STEP = K::N_STEP;
+  static constexpr int K_STEP = K::K_STEP;
+  static constexpr bool SCALE = true;
+
+  // Scales start on a 64B boundary. n%N_STEP==0 and k%K_STEP==0 already make
+  // n*k/2 a multiple of 512, but round explicitly so the invariant is local.
+  static size_t scale_offset(int n, int k) {
+    return ((static_cast<size_t>(n) * static_cast<size_t>(k) / 2) + 63) & ~static_cast<size_t>(63);
+  }
+
+  static size_t required_size(int n, int k, int k_group_size) {
+    // Round the total to 64 as well: the caller hands this straight to
+    // std::aligned_alloc, whose size must be a multiple of the alignment.
+    // (The scale region is n*(k/gs) bytes, which need not be 64-aligned.)
+    size_t total = scale_offset(n, k) + static_cast<size_t>(n) * (k / k_group_size);
+    return (total + 63) & ~static_cast<size_t>(63);
+  }
+
+  BufferBMXFP4KGroupImpl(int n, int k, int k_group_size, void* ptr) : n(n), k(k), k_group_size(k_group_size) {
+    assert(reinterpret_cast<intptr_t>(ptr) % 64 == 0);
+    if (n % N_STEP || k % K_STEP || k % k_group_size) {
+      printf("BufferBMXFP4KGroupImpl: n=%d k=%d N_STEP=%d K_STEP=%d gs=%d\n", n, k, N_STEP, K_STEP, k_group_size);
+      throw std::runtime_error("n or k is not aligned to N_STEP or K_STEP");
+    }
+    k_group_count = k / k_group_size;
+    b = reinterpret_cast<dt*>(ptr);
+    d = reinterpret_cast<uint8_t*>(ptr) + scale_offset(n, k);
+  }
+
+  void from_raw_mat(const uint8_t* proj, int ith, int nth) {
+    auto [n_start, n_end] = K::split_range_n(n, ith, nth);
+    if (n_start >= n_end) return;
+    const size_t row_bytes = static_cast<size_t>(k) / 2;
+    const size_t rows = static_cast<size_t>(n_end - n_start);
+    std::memcpy(reinterpret_cast<uint8_t*>(b) + n_start * row_bytes, proj + n_start * row_bytes, rows * row_bytes);
+  }
+
+  // Raw E8M0 scale bytes: copied verbatim, expanded at use time.
+  void scales_from_raw(const uint8_t* src, int ith, int nth) {
+    auto [n_start, n_end] = K::split_range_n(n, ith, nth);
+    if (n_start >= n_end) return;
+    const size_t row = static_cast<size_t>(k_group_count);
+    std::memcpy(d + n_start * row, src + n_start * row, static_cast<size_t>(n_end - n_start) * row);
+  }
+
+  dt* get_submat(int n, int k, int n_begin, int k_begin) {
+    const size_t row_bytes = static_cast<size_t>(k) / 2;
+    return reinterpret_cast<dt*>(reinterpret_cast<uint8_t*>(b) + static_cast<size_t>(n_begin) * row_bytes +
+                                 static_cast<size_t>(k_begin) / 2);
+  }
+
+  const uint8_t* get_scale(int /*n*/, int n_begin, int k, int k_begin) const {
+    return d + static_cast<size_t>(n_begin) * (k / k_group_size) + k_begin / k_group_size;
+  }
+
+  static std::pair<int, int> split_range_n(int n, int ith, int nth) {
+    int n_per_thread = (n + nth - 1) / nth;
+    n_per_thread = (n_per_thread + N_STEP - 1) / N_STEP * N_STEP;
+    int n_start = std::min(ith * n_per_thread, n);
+    int n_end = std::min(n_start + n_per_thread, n);
+    return {n_start, n_end};
+  }
+};
 
 // ============================================================================
 // MXFP4 kernel: FP4 E2M1 weights × BF16 activations → FP32 output (AVX512)
@@ -139,8 +219,8 @@ struct GemmKernel224MXFP4SmallKGroup {
   }
 
   // Buffers
-  using BufferA = BufferABF16Impl<GemmKernel224MXFP4SmallKGroup>;        // raw BF16, no quant
-  using BufferB = BufferBInt4KGroupImpl<GemmKernel224MXFP4SmallKGroup>;  // nibble-packed FP4
+  using BufferA = BufferABF16Impl<GemmKernel224MXFP4SmallKGroup>;         // raw BF16, no quant
+  using BufferB = BufferBMXFP4KGroupImpl<GemmKernel224MXFP4SmallKGroup>;  // FP4 nibbles + E8M0 scales
   using BufferC = BufferCReduceImpl<GemmKernel224MXFP4SmallKGroup>;      // FP32 reduce
 
   // 4 个 zmm 的 horizontal reduce → 4 个连续 fp32。
@@ -170,10 +250,10 @@ struct GemmKernel224MXFP4SmallKGroup {
         __m128i* w1 = (__m128i*)bb->get_submat(n, k, n_pos + 1, 0);
         __m128i* w2 = (__m128i*)bb->get_submat(n, k, n_pos + 2, 0);
         __m128i* w3 = (__m128i*)bb->get_submat(n, k, n_pos + 3, 0);
-        const float* s0 = bb->get_scale(n, n_pos + 0, k, 0);
-        const float* s1 = bb->get_scale(n, n_pos + 1, k, 0);
-        const float* s2 = bb->get_scale(n, n_pos + 2, k, 0);
-        const float* s3 = bb->get_scale(n, n_pos + 3, k, 0);
+        const uint8_t* s0 = bb->get_scale(n, n_pos + 0, k, 0);
+        const uint8_t* s1 = bb->get_scale(n, n_pos + 1, k, 0);
+        const uint8_t* s2 = bb->get_scale(n, n_pos + 2, k, 0);
+        const uint8_t* s3 = bb->get_scale(n, n_pos + 3, k, 0);
 
         __m512 acc0 = _mm512_setzero_ps();
         __m512 acc1 = _mm512_setzero_ps();
@@ -186,22 +266,22 @@ struct GemmKernel224MXFP4SmallKGroup {
           const DequantizedWeight d1(w1[g]);
           const DequantizedWeight d2(w2[g]);
           const DequantizedWeight d3(w3[g]);
-          acc0 = _mm512_fmadd_ps(_mm512_set1_ps(s0[g]), mxfp4_dot_bf16(d0, a), acc0);
-          acc1 = _mm512_fmadd_ps(_mm512_set1_ps(s1[g]), mxfp4_dot_bf16(d1, a), acc1);
-          acc2 = _mm512_fmadd_ps(_mm512_set1_ps(s2[g]), mxfp4_dot_bf16(d2, a), acc2);
-          acc3 = _mm512_fmadd_ps(_mm512_set1_ps(s3[g]), mxfp4_dot_bf16(d3, a), acc3);
+          acc0 = _mm512_fmadd_ps(_mm512_set1_ps(e8m0_to_fp32(s0[g])), mxfp4_dot_bf16(d0, a), acc0);
+          acc1 = _mm512_fmadd_ps(_mm512_set1_ps(e8m0_to_fp32(s1[g])), mxfp4_dot_bf16(d1, a), acc1);
+          acc2 = _mm512_fmadd_ps(_mm512_set1_ps(e8m0_to_fp32(s2[g])), mxfp4_dot_bf16(d2, a), acc2);
+          acc3 = _mm512_fmadd_ps(_mm512_set1_ps(e8m0_to_fp32(s3[g])), mxfp4_dot_bf16(d3, a), acc3);
         }
         reduce4(acc0, acc1, acc2, acc3, c_row + (n_pos - n_start));
       }
       // N 尾巴: N % 4 != 0 时单行 fallback
       for (; n_pos < n_end; n_pos++) {
         __m128i* w = (__m128i*)bb->get_submat(n, k, n_pos, 0);
-        const float* s = bb->get_scale(n, n_pos, k, 0);
+        const uint8_t* s = bb->get_scale(n, n_pos, k, 0);
         __m512 acc = _mm512_setzero_ps();
         for (int g = 0; g < kg_count; g++) {
           const ActivationBF16 a(a_row[g]);
           const DequantizedWeight d(w[g]);
-          acc = _mm512_fmadd_ps(_mm512_set1_ps(s[g]), mxfp4_dot_bf16(d, a), acc);
+          acc = _mm512_fmadd_ps(_mm512_set1_ps(e8m0_to_fp32(s[g])), mxfp4_dot_bf16(d, a), acc);
         }
         c_row[n_pos - n_start] = _mm512_reduce_add_ps(acc);
       }
@@ -234,10 +314,10 @@ struct GemmKernel224MXFP4SmallKGroup {
         __m128i* w1 = (__m128i*)bb->get_submat(n, k, n_pos + 1, 0);
         __m128i* w2 = (__m128i*)bb->get_submat(n, k, n_pos + 2, 0);
         __m128i* w3 = (__m128i*)bb->get_submat(n, k, n_pos + 3, 0);
-        const float* s0 = bb->get_scale(n, n_pos + 0, k, 0);
-        const float* s1 = bb->get_scale(n, n_pos + 1, k, 0);
-        const float* s2 = bb->get_scale(n, n_pos + 2, k, 0);
-        const float* s3 = bb->get_scale(n, n_pos + 3, k, 0);
+        const uint8_t* s0 = bb->get_scale(n, n_pos + 0, k, 0);
+        const uint8_t* s1 = bb->get_scale(n, n_pos + 1, k, 0);
+        const uint8_t* s2 = bb->get_scale(n, n_pos + 2, k, 0);
+        const uint8_t* s3 = bb->get_scale(n, n_pos + 3, k, 0);
 
         __m512 acc[MB][NB];
         for (int i = 0; i < MB; i++)
@@ -249,10 +329,10 @@ struct GemmKernel224MXFP4SmallKGroup {
           const DequantizedWeight d1(w1[g]);
           const DequantizedWeight d2(w2[g]);
           const DequantizedWeight d3(w3[g]);
-          const __m512 sv0 = _mm512_set1_ps(s0[g]);
-          const __m512 sv1 = _mm512_set1_ps(s1[g]);
-          const __m512 sv2 = _mm512_set1_ps(s2[g]);
-          const __m512 sv3 = _mm512_set1_ps(s3[g]);
+          const __m512 sv0 = _mm512_set1_ps(e8m0_to_fp32(s0[g]));
+          const __m512 sv1 = _mm512_set1_ps(e8m0_to_fp32(s1[g]));
+          const __m512 sv2 = _mm512_set1_ps(e8m0_to_fp32(s2[g]));
+          const __m512 sv3 = _mm512_set1_ps(e8m0_to_fp32(s3[g]));
 
 #define V_FMA_ROW(M_I)                                                      \
   do {                                                                      \
@@ -276,14 +356,14 @@ struct GemmKernel224MXFP4SmallKGroup {
       // N 尾巴: 单 N 列 × MB token (V4 不触发)
       for (; n_pos < n_end; n_pos++) {
         __m128i* w = (__m128i*)bb->get_submat(n, k, n_pos, 0);
-        const float* s = bb->get_scale(n, n_pos, k, 0);
+        const uint8_t* s = bb->get_scale(n, n_pos, k, 0);
         for (int i = 0; i < MB; i++) {
           float* c_row = bc->get_submat(m, n, m_pos + i, n_start);
           __m512 acc = _mm512_setzero_ps();
           for (int g = 0; g < kg_count; g++) {
             const ActivationBF16 a(a_rows[i][g]);
             const DequantizedWeight d(w[g]);
-            acc = _mm512_fmadd_ps(_mm512_set1_ps(s[g]), mxfp4_dot_bf16(d, a), acc);
+            acc = _mm512_fmadd_ps(_mm512_set1_ps(e8m0_to_fp32(s[g])), mxfp4_dot_bf16(d, a), acc);
           }
           c_row[n_pos - n_start] = _mm512_reduce_add_ps(acc);
         }
@@ -299,10 +379,10 @@ struct GemmKernel224MXFP4SmallKGroup {
         __m128i* w1 = (__m128i*)bb->get_submat(n, k, n_pos + 1, 0);
         __m128i* w2 = (__m128i*)bb->get_submat(n, k, n_pos + 2, 0);
         __m128i* w3 = (__m128i*)bb->get_submat(n, k, n_pos + 3, 0);
-        const float* s0 = bb->get_scale(n, n_pos + 0, k, 0);
-        const float* s1 = bb->get_scale(n, n_pos + 1, k, 0);
-        const float* s2 = bb->get_scale(n, n_pos + 2, k, 0);
-        const float* s3 = bb->get_scale(n, n_pos + 3, k, 0);
+        const uint8_t* s0 = bb->get_scale(n, n_pos + 0, k, 0);
+        const uint8_t* s1 = bb->get_scale(n, n_pos + 1, k, 0);
+        const uint8_t* s2 = bb->get_scale(n, n_pos + 2, k, 0);
+        const uint8_t* s3 = bb->get_scale(n, n_pos + 3, k, 0);
         __m512 a0 = _mm512_setzero_ps(), a1 = _mm512_setzero_ps(), a2 = _mm512_setzero_ps(), a3 = _mm512_setzero_ps();
         for (int g = 0; g < kg_count; g++) {
           const ActivationBF16 a(a_row[g]);
@@ -310,21 +390,21 @@ struct GemmKernel224MXFP4SmallKGroup {
           const DequantizedWeight d1(w1[g]);
           const DequantizedWeight d2(w2[g]);
           const DequantizedWeight d3(w3[g]);
-          a0 = _mm512_fmadd_ps(_mm512_set1_ps(s0[g]), mxfp4_dot_bf16(d0, a), a0);
-          a1 = _mm512_fmadd_ps(_mm512_set1_ps(s1[g]), mxfp4_dot_bf16(d1, a), a1);
-          a2 = _mm512_fmadd_ps(_mm512_set1_ps(s2[g]), mxfp4_dot_bf16(d2, a), a2);
-          a3 = _mm512_fmadd_ps(_mm512_set1_ps(s3[g]), mxfp4_dot_bf16(d3, a), a3);
+          a0 = _mm512_fmadd_ps(_mm512_set1_ps(e8m0_to_fp32(s0[g])), mxfp4_dot_bf16(d0, a), a0);
+          a1 = _mm512_fmadd_ps(_mm512_set1_ps(e8m0_to_fp32(s1[g])), mxfp4_dot_bf16(d1, a), a1);
+          a2 = _mm512_fmadd_ps(_mm512_set1_ps(e8m0_to_fp32(s2[g])), mxfp4_dot_bf16(d2, a), a2);
+          a3 = _mm512_fmadd_ps(_mm512_set1_ps(e8m0_to_fp32(s3[g])), mxfp4_dot_bf16(d3, a), a3);
         }
         reduce4(a0, a1, a2, a3, c_row + (n_pos - n_start));
       }
       for (; n_pos < n_end; n_pos++) {
         __m128i* w = (__m128i*)bb->get_submat(n, k, n_pos, 0);
-        const float* s = bb->get_scale(n, n_pos, k, 0);
+        const uint8_t* s = bb->get_scale(n, n_pos, k, 0);
         __m512 acc = _mm512_setzero_ps();
         for (int g = 0; g < kg_count; g++) {
           const ActivationBF16 a(a_row[g]);
           const DequantizedWeight d(w[g]);
-          acc = _mm512_fmadd_ps(_mm512_set1_ps(s[g]), mxfp4_dot_bf16(d, a), acc);
+          acc = _mm512_fmadd_ps(_mm512_set1_ps(e8m0_to_fp32(s[g])), mxfp4_dot_bf16(d, a), acc);
         }
         c_row[n_pos - n_start] = _mm512_reduce_add_ps(acc);
       }
@@ -480,12 +560,13 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
           uint64_t expert_idx = task_id;
           uint64_t logical_expert_id = expert_map(physical_to_logical_map, expert_idx);
           size_t scale_elem_count = (config_.hidden_size * config_.intermediate_size) / config_.quant_config.group_size;
-          convert_or_copy(gate_bb_[expert_idx]->d,
-                          (ggml_bf16_t*)config_.gate_scale + (logical_expert_id * scale_elem_count), scale_elem_count);
-          convert_or_copy(up_bb_[expert_idx]->d,
-                          (ggml_bf16_t*)config_.up_scale + (logical_expert_id * scale_elem_count), scale_elem_count);
-          convert_or_copy(down_bb_[expert_idx]->d,
-                          (ggml_bf16_t*)config_.down_scale + (logical_expert_id * scale_elem_count), scale_elem_count);
+          // E8M0 codes stay resident as raw bytes; the kernels expand them.
+          std::memcpy(gate_bb_[expert_idx]->d, (const uint8_t*)config_.gate_scale + (logical_expert_id * scale_elem_count),
+                      scale_elem_count);
+          std::memcpy(up_bb_[expert_idx]->d, (const uint8_t*)config_.up_scale + (logical_expert_id * scale_elem_count),
+                      scale_elem_count);
+          std::memcpy(down_bb_[expert_idx]->d, (const uint8_t*)config_.down_scale + (logical_expert_id * scale_elem_count),
+                      scale_elem_count);
         },
         nullptr);
   }
@@ -503,18 +584,17 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     if (bytes -= chunks * 64) std::memcpy(d, s, bytes);
   }
 
-  static inline void fast_fp32_to_bf16(ggml_bf16_t* __restrict dst, const float* __restrict src, size_t count) {
+  // Resident scales are E8M0 bytes; the GPU-side scale buffer contract is bf16.
+  // bf16 shares the fp32 exponent field, so the conversion is `code << 7` — the
+  // same value the old fp32-resident path produced via fp32->bf16, exactly.
+  static inline void fast_e8m0_to_bf16(ggml_bf16_t* __restrict dst, const uint8_t* __restrict src, size_t count) {
     size_t i = 0;
     for (; i + 32 <= count; i += 32) {
-      __m512 v0 = _mm512_loadu_ps(src + i);
-      __m512 v1 = _mm512_loadu_ps(src + i + 16);
-      __m512i i0 = _mm512_srli_epi32(_mm512_castps_si512(v0), 16);
-      __m512i i1 = _mm512_srli_epi32(_mm512_castps_si512(v1), 16);
-      __m512i packed = _mm512_packus_epi32(i0, i1);
-      __m512i permuted = _mm512_permutexvar_epi64(_mm512_set_epi64(7, 5, 3, 1, 6, 4, 2, 0), packed);
-      _mm512_storeu_si512((__m512i*)(dst + i), permuted);
+      __m256i codes = _mm256_loadu_si256((const __m256i*)(src + i));
+      __m512i widened = _mm512_cvtepu8_epi16(codes);
+      _mm512_storeu_si512((__m512i*)(dst + i), _mm512_slli_epi16(widened, 7));
     }
-    for (; i < count; i++) dst[i] = ggml_fp32_to_bf16(src[i]);
+    for (; i < count; i++) dst[i] = e8m0_to_bf16(src[i]);
   }
 
   void write_weights_to_buffer(int gpu_tp_count, int cpu_tp_count, int expert_id, const GeneralMOEConfig& full_config,
@@ -589,13 +669,13 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
               for (size_t col = col_start; col < col_end; col++) {
                 fast_memcpy(w2_weight_dst + col * gpu_weight_stride + gpu_weight_slice_offset,
                             (uint8_t*)down_bb_[expert_id]->b + col * weight_per_col, weight_per_col);
-                fast_fp32_to_bf16(w2_scale_dst + col * gpu_scale_stride + gpu_scale_slice_offset,
+                fast_e8m0_to_bf16(w2_scale_dst + col * gpu_scale_stride + gpu_scale_slice_offset,
                                   down_bb_[expert_id]->d + col * scale_per_col, scale_per_col);
               }
             } else if (task_id == NUM_WEIGHT_TASKS * 2 + num_down_tasks) {
-              fast_fp32_to_bf16(w13_scale_dst + offset_in_gpu_scale, gate_bb_[expert_id]->d, cpu_tp_scale_elem_count);
+              fast_e8m0_to_bf16(w13_scale_dst + offset_in_gpu_scale, gate_bb_[expert_id]->d, cpu_tp_scale_elem_count);
             } else {
-              fast_fp32_to_bf16(w13_scale_dst + offset_in_gpu_scale + gpu_tp_scale_elem_count, up_bb_[expert_id]->d,
+              fast_e8m0_to_bf16(w13_scale_dst + offset_in_gpu_scale + gpu_tp_scale_elem_count, up_bb_[expert_id]->d,
                                 cpu_tp_scale_elem_count);
             }
           },
@@ -665,13 +745,13 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
 
                 fast_memcpy(w2_weight_dst + col * weight_per_gpu_col,
                             (uint8_t*)down_bb_[expert_id]->b + col_offset_weight, weight_per_gpu_col);
-                fast_fp32_to_bf16(w2_scale_dst + col * scale_per_gpu_col, down_bb_[expert_id]->d + col_offset_scale,
+                fast_e8m0_to_bf16(w2_scale_dst + col * scale_per_gpu_col, down_bb_[expert_id]->d + col_offset_scale,
                                   scale_per_gpu_col);
               }
             } else if (task_type == NUM_WEIGHT_TASKS * 2 + num_down_tasks) {
-              fast_fp32_to_bf16(w13_scale_dst, gate_bb_[expert_id]->d + cpu_offset_scale, data_per_gpu_tp_scale);
+              fast_e8m0_to_bf16(w13_scale_dst, gate_bb_[expert_id]->d + cpu_offset_scale, data_per_gpu_tp_scale);
             } else {
-              fast_fp32_to_bf16(w13_scale_dst + gpu_tp_scale_elem_count, up_bb_[expert_id]->d + cpu_offset_scale,
+              fast_e8m0_to_bf16(w13_scale_dst + gpu_tp_scale_elem_count, up_bb_[expert_id]->d + cpu_offset_scale,
                                 data_per_gpu_tp_scale);
             }
           },
@@ -713,9 +793,9 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
       tpc.gate_proj = new uint8_t[(tpc.expert_num * weight_elem_count) / 2];
       tpc.up_proj = new uint8_t[(tpc.expert_num * weight_elem_count) / 2];
       tpc.down_proj = new uint8_t[(tpc.expert_num * weight_elem_count) / 2];
-      tpc.gate_scale = new ggml_bf16_t[tpc.expert_num * scales_elem_count];
-      tpc.up_scale = new ggml_bf16_t[tpc.expert_num * scales_elem_count];
-      tpc.down_scale = new ggml_bf16_t[tpc.expert_num * scales_elem_count];
+      tpc.gate_scale = new uint8_t[tpc.expert_num * scales_elem_count];
+      tpc.up_scale = new uint8_t[tpc.expert_num * scales_elem_count];
+      tpc.down_scale = new uint8_t[tpc.expert_num * scales_elem_count];
 
       if (use_per_expert_ptrs) {
         pool->get_subpool(i)->do_work_stealing_job(
@@ -726,28 +806,28 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
               uint8_t* src_gate = (uint8_t*)config.gate_projs[0][expert_id];
               uint8_t* src_up = (uint8_t*)config.up_projs[0][expert_id];
               uint8_t* src_down = (uint8_t*)config.down_projs[0][expert_id];
-              ggml_bf16_t* src_gate_scale = (ggml_bf16_t*)config.gate_scales[0][expert_id];
-              ggml_bf16_t* src_up_scale = (ggml_bf16_t*)config.up_scales[0][expert_id];
-              ggml_bf16_t* src_down_scale = (ggml_bf16_t*)config.down_scales[0][expert_id];
+              const uint8_t* src_gate_scale = (const uint8_t*)config.gate_scales[0][expert_id];
+              const uint8_t* src_up_scale = (const uint8_t*)config.up_scales[0][expert_id];
+              const uint8_t* src_down_scale = (const uint8_t*)config.down_scales[0][expert_id];
 
               memcpy((uint8_t*)tpc.gate_proj + ((expert_id * weight_elem_count) >> 1),
                      src_gate + ((i * weight_elem_count) >> 1), (weight_elem_count >> 1));
               memcpy((uint8_t*)tpc.up_proj + ((expert_id * weight_elem_count) >> 1),
                      src_up + ((i * weight_elem_count) >> 1), (weight_elem_count >> 1));
-              memcpy((ggml_bf16_t*)tpc.gate_scale + (expert_id * scales_elem_count),
-                     src_gate_scale + (i * scales_elem_count), sizeof(ggml_bf16_t) * scales_elem_count);
-              memcpy((ggml_bf16_t*)tpc.up_scale + (expert_id * scales_elem_count),
-                     src_up_scale + (i * scales_elem_count), sizeof(ggml_bf16_t) * scales_elem_count);
+              memcpy((uint8_t*)tpc.gate_scale + (expert_id * scales_elem_count),
+                     src_gate_scale + (i * scales_elem_count), scales_elem_count);
+              memcpy((uint8_t*)tpc.up_scale + (expert_id * scales_elem_count),
+                     src_up_scale + (i * scales_elem_count), scales_elem_count);
 
               for (size_t col = 0; col < config.hidden_size; col++) {
                 memcpy((uint8_t*)tpc.down_proj + ((expert_id * weight_elem_count + col * tpc.intermediate_size) >> 1),
                        src_down + ((col * config.intermediate_size + i * tpc.intermediate_size) >> 1),
                        (tpc.intermediate_size >> 1));
-                memcpy((ggml_bf16_t*)tpc.down_scale +
+                memcpy((uint8_t*)tpc.down_scale +
                            (expert_id * scales_elem_count + col * (tpc.intermediate_size / group_size)),
                        src_down_scale +
                            (col * (config.intermediate_size / group_size) + i * (tpc.intermediate_size / group_size)),
-                       sizeof(ggml_bf16_t) * (tpc.intermediate_size / group_size));
+                       (tpc.intermediate_size / group_size));
               }
             },
             nullptr);
@@ -766,16 +846,16 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
                        (uint8_t*)config.up_proj +
                            ((expert_id * config.intermediate_size * config.hidden_size + i * weight_elem_count) >> 1),
                        (weight_elem_count >> 1));
-                memcpy((ggml_bf16_t*)tpc.gate_scale + (expert_id * scales_elem_count),
-                       (ggml_bf16_t*)config.gate_scale +
+                memcpy((uint8_t*)tpc.gate_scale + (expert_id * scales_elem_count),
+                       (const uint8_t*)config.gate_scale +
                            (expert_id * (config.hidden_size / group_size) * config.intermediate_size +
                             i * scales_elem_count),
-                       sizeof(ggml_bf16_t) * scales_elem_count);
-                memcpy((ggml_bf16_t*)tpc.up_scale + (expert_id * scales_elem_count),
-                       (ggml_bf16_t*)config.up_scale +
+                       scales_elem_count);
+                memcpy((uint8_t*)tpc.up_scale + (expert_id * scales_elem_count),
+                       (const uint8_t*)config.up_scale +
                            (expert_id * (config.hidden_size / group_size) * config.intermediate_size +
                             i * scales_elem_count),
-                       sizeof(ggml_bf16_t) * scales_elem_count);
+                       scales_elem_count);
 
                 for (size_t col = 0; col < config.hidden_size; col++) {
                   memcpy((uint8_t*)tpc.down_proj + ((expert_id * weight_elem_count + col * tpc.intermediate_size) >> 1),
@@ -783,12 +863,12 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
                                                         col * config.intermediate_size + i * tpc.intermediate_size) >>
                                                        1),
                          (tpc.intermediate_size >> 1));
-                  memcpy((ggml_bf16_t*)tpc.down_scale +
+                  memcpy((uint8_t*)tpc.down_scale +
                              (expert_id * scales_elem_count + col * (tpc.intermediate_size / group_size)),
-                         (ggml_bf16_t*)config.down_scale +
+                         (const uint8_t*)config.down_scale +
                              ((expert_id * (config.intermediate_size / group_size) * config.hidden_size) +
                               col * (config.intermediate_size / group_size) + i * (tpc.intermediate_size / group_size)),
-                         sizeof(ggml_bf16_t) * (tpc.intermediate_size / group_size));
+                         (tpc.intermediate_size / group_size));
                 }
               },
               nullptr);
@@ -804,9 +884,9 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
       delete[] (uint8_t*)(tpc.gate_proj);
       delete[] (uint8_t*)(tpc.up_proj);
       delete[] (uint8_t*)(tpc.down_proj);
-      delete[] (ggml_bf16_t*)(tpc.gate_scale);
-      delete[] (ggml_bf16_t*)(tpc.up_scale);
-      delete[] (ggml_bf16_t*)(tpc.down_scale);
+      delete[] (uint8_t*)(tpc.gate_scale);
+      delete[] (uint8_t*)(tpc.up_scale);
+      delete[] (uint8_t*)(tpc.down_scale);
     });
 
     this->weights_loaded = true;

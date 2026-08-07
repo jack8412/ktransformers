@@ -239,9 +239,9 @@ def build_flat_config(data, hidden=hidden_size, inter=intermediate_size, qlen_ma
     gate_qw = torch.stack(data["packed"]["gate"]).contiguous()
     up_qw = torch.stack(data["packed"]["up"]).contiguous()
     down_qw = torch.stack(data["packed"]["down"]).contiguous()
-    gate_sc = torch.stack(data["scale_bf16"]["gate"]).contiguous()
-    up_sc = torch.stack(data["scale_bf16"]["up"]).contiguous()
-    down_sc = torch.stack(data["scale_bf16"]["down"]).contiguous()
+    gate_sc = torch.stack(data["scale_u8"]["gate"]).contiguous()
+    up_sc = torch.stack(data["scale_u8"]["up"]).contiguous()
+    down_sc = torch.stack(data["scale_u8"]["down"]).contiguous()
 
     config = kt_kernel_ext.moe.MOEConfig(expert_num, num_experts_per_tok, hidden, inter, 0)
     config.max_len = qlen_max
@@ -559,8 +559,8 @@ def _assert_loader_dict_matches(weights_dict, data):
             assert weights_dict[proj][e].dtype == torch.uint8
             assert torch.equal(weights_dict[proj][e], data["packed"][proj][e])
             got_scale = weights_dict[f"{proj}_scale"][e]
-            assert got_scale.dtype == torch.bfloat16
-            assert torch.equal(got_scale.view(torch.int16), data["scale_bf16"][proj][e].view(torch.int16))
+            assert got_scale.dtype == torch.uint8, "MXFP4 scales stay resident as raw ue8m0 bytes"
+            assert torch.equal(got_scale, data["scale_u8"][proj][e])
 
 
 def test_k3_naming_loader():
