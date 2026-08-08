@@ -14,6 +14,7 @@
 #ifndef CPUINFER_OPERATOR_AMX_FP4_MOE_H
 #define CPUINFER_OPERATOR_AMX_FP4_MOE_H
 
+#include <cstdlib>
 #include "la/amx_raw_buffers.hpp"  // BufferABF16Impl
 #include "moe_base.hpp"
 
@@ -494,18 +495,34 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     auto& bb = do_up ? up_bb_[expert_idx] : gate_bb_[expert_idx];
     auto& bc = do_up ? up_bc_[expert_idx] : gate_bc_[expert_idx];
 
-    if (qlen > 4 * config_.expert_num / config_.num_experts_per_tok) {
+    if (use_mat_mul(qlen)) {
       amx::mat_mul_kgroup(m, config_.intermediate_size, config_.hidden_size, group_size, ba, bb, bc, ith, nth);
     } else {
       amx::vec_mul_kgroup(m, config_.intermediate_size, config_.hidden_size, group_size, ba, bb, bc, ith, nth);
     }
   }
 
+  // The default heuristic (qlen > 4*E/topk = 224 for K3) tunes for plain
+  // prefill, where per-expert row counts track batch qlen.  Speculative
+  // VERIFY batches sit far below it (bs x draft_tokens <= ~232) yet re-read
+  // every expert's weights per token on the vec path — the mat path
+  // amortizes the weight reads exactly there.  KT_MOE_MATMUL_MIN_QLEN
+  // overrides the switch point; unset keeps the historical behavior
+  // (and the golden gate's bitwise pin) untouched.
+  bool use_mat_mul(int qlen) const {
+    static const int min_qlen = []() {
+      const char* env = std::getenv("KT_MOE_MATMUL_MIN_QLEN");
+      return env ? std::atoi(env) : -1;
+    }();
+    if (min_qlen >= 0) return qlen >= min_qlen;
+    return qlen > 4 * config_.expert_num / config_.num_experts_per_tok;
+  }
+
   void do_down_gemm(int expert_idx, int ith, int nth, int qlen) {
     auto& group_size = config_.quant_config.group_size;
     int m = m_local_num_[expert_idx];
 
-    if (qlen > 4 * config_.expert_num / config_.num_experts_per_tok) {
+    if (use_mat_mul(qlen)) {
       amx::mat_mul_kgroup(m, config_.hidden_size, config_.intermediate_size, group_size, down_ba_[expert_idx],
                           down_bb_[expert_idx], down_bc_[expert_idx], ith, nth);
     } else {
