@@ -15,8 +15,41 @@
 #define CPUINFER_OPERATOR_AMX_FP4_MOE_H
 
 #include <cstdlib>
+#include <map>
+#include <mutex>
+#include <utility>
 #include "la/amx_raw_buffers.hpp"  // BufferABF16Impl
 #include "moe_base.hpp"
+
+// Staging arenas for weight loading, reused across layers.
+//
+// Every MoE layer of a given model has identical expert geometry, so the
+// previous per-layer `new uint8_t[]` paid first-touch page faults on several
+// GB of fresh anonymous memory once per layer -- 92 times over on Kimi-K3,
+// for buffers of the same shape that were freed moments later. Reuse keeps
+// the pages hot and removes that cost entirely.
+//
+// NUMA placement is preserved by construction: the first allocation happens
+// on the owning socket's thread inside do_numa_job, so first touch binds the
+// pages to that socket, and every later layer reuses the same arena from the
+// same socket. The mutex serialises only the (rare) allocation, never the
+// copies.
+inline uint8_t* kt_staging_arena(int numa_id, int which, size_t bytes) {
+  static std::mutex mu;
+  static std::map<std::pair<int, int>, std::pair<uint8_t*, size_t>> arenas;
+  std::lock_guard<std::mutex> lock(mu);
+  auto key = std::make_pair(numa_id, which);
+  auto it = arenas.find(key);
+  if (it != arenas.end()) {
+    if (it->second.second >= bytes) return it->second.first;
+    delete[] it->second.first;
+    arenas.erase(it);
+  }
+  uint8_t* p = new uint8_t[bytes];
+  arenas.emplace(key, std::make_pair(p, bytes));
+  return p;
+}
+
 
 namespace amx {
 
@@ -807,12 +840,14 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
       size_t weight_elem_count = tpc.intermediate_size * tpc.hidden_size;
       size_t scales_elem_count = (tpc.hidden_size / group_size) * tpc.intermediate_size;
 
-      tpc.gate_proj = new uint8_t[(tpc.expert_num * weight_elem_count) / 2];
-      tpc.up_proj = new uint8_t[(tpc.expert_num * weight_elem_count) / 2];
-      tpc.down_proj = new uint8_t[(tpc.expert_num * weight_elem_count) / 2];
-      tpc.gate_scale = new uint8_t[tpc.expert_num * scales_elem_count];
-      tpc.up_scale = new uint8_t[tpc.expert_num * scales_elem_count];
-      tpc.down_scale = new uint8_t[tpc.expert_num * scales_elem_count];
+      const size_t w_bytes = (tpc.expert_num * weight_elem_count) / 2;
+      const size_t s_bytes = tpc.expert_num * scales_elem_count;
+      tpc.gate_proj = kt_staging_arena(i, 0, w_bytes);
+      tpc.up_proj = kt_staging_arena(i, 1, w_bytes);
+      tpc.down_proj = kt_staging_arena(i, 2, w_bytes);
+      tpc.gate_scale = kt_staging_arena(i, 3, s_bytes);
+      tpc.up_scale = kt_staging_arena(i, 4, s_bytes);
+      tpc.down_scale = kt_staging_arena(i, 5, s_bytes);
 
       if (use_per_expert_ptrs) {
         pool->get_subpool(i)->do_work_stealing_job(
@@ -896,14 +931,18 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
 
     DO_TPS_LOAD_WEIGHTS(pool);
 
+    // Staging is owned by the per-socket arenas and deliberately retained
+    // for the next layer; clear the borrowed pointers so nothing mistakes
+    // them for this layer's live weights (the residents were memcpy'd out
+    // above by DO_TPS_LOAD_WEIGHTS).
     pool->dispense_backend()->do_numa_job([&, this](int i) {
       auto& tpc = tps[i]->config_;
-      delete[] (uint8_t*)(tpc.gate_proj);
-      delete[] (uint8_t*)(tpc.up_proj);
-      delete[] (uint8_t*)(tpc.down_proj);
-      delete[] (uint8_t*)(tpc.gate_scale);
-      delete[] (uint8_t*)(tpc.up_scale);
-      delete[] (uint8_t*)(tpc.down_scale);
+      tpc.gate_proj = nullptr;
+      tpc.up_proj = nullptr;
+      tpc.down_proj = nullptr;
+      tpc.gate_scale = nullptr;
+      tpc.up_scale = nullptr;
+      tpc.down_scale = nullptr;
     });
 
     this->weights_loaded = true;

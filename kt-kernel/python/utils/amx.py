@@ -723,6 +723,22 @@ class NativeMoEWrapper(BaseMoEWrapper):
     def force_release_loader():
         NativeMoEWrapper._release_loader()
 
+    _atexit_registered = False
+
+    @staticmethod
+    def _register_loader_atexit():
+        """Release the retained safetensors mappings at process exit.
+
+        Registered lazily from the load path so a process that never loads CPU
+        experts does not install the hook at all.
+        """
+        if NativeMoEWrapper._atexit_registered:
+            return
+        import atexit
+
+        NativeMoEWrapper._atexit_registered = True
+        atexit.register(NativeMoEWrapper._release_loader)
+
     def load_weights_from_tensors(
         self,
         gate_proj: torch.Tensor,
@@ -1006,7 +1022,25 @@ class NativeMoEWrapper(BaseMoEWrapper):
             del self.up_scales
             del self.down_scales
 
-        NativeMoEWrapper._release_loader(layer_idx=self.layer_idx)
+        # Loader lifecycle: create once, load every CPU layer, release once.
+        #
+        # This used to close_all_handles() after EVERY layer, so the next
+        # layer paid a full loader reconstruction: re-reading the safetensors
+        # index and re-mmapping the shards. Measured at ~778 ms per layer on
+        # Kimi-K3, i.e. ~71 s across 92 MoE layers spent solely tearing down
+        # and rebuilding mappings that the next layer immediately needs again.
+        #
+        # Retaining them is safe here because nothing points INTO the mapping:
+        # load_weights memcpys out of it into the resident BufferB allocations
+        # (the AVX2 path that once aliased the mmap was reverted for exactly
+        # that reason). The retained pages are clean and file-backed, so the
+        # kernel can evict them under pressure without writeback -- they cost
+        # address space and 96 file descriptors, not committed memory.
+        #
+        # Explicit teardown is available via force_release_loader() and is
+        # registered at exit; callers that load a bounded set of layers and
+        # want the descriptors back can call it directly.
+        NativeMoEWrapper._register_loader_atexit()
         t6 = time.time()
 
         print(
