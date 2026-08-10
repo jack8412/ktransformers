@@ -302,6 +302,13 @@ class BaseMoEWrapper(_MoEBase, ABC):
         self.max_deferred_experts_per_token = (
             int(max_deferred_experts_per_token) if max_deferred_experts_per_token is not None else 0
         )
+        # A submit may be completed inline (no worker wake) when the batch
+        # routes entirely to GPU-resident experts. Only legal with deferral
+        # off: sync_forward's allow_pending is derived from whether THIS layer
+        # left a deferred task outstanding, so an inlined submit would make
+        # the pending count disagree with that assumption and let a sync
+        # return before the immediate task had run.
+        self._allow_inline_empty = self.max_deferred_experts_per_token == 0
 
         BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = False
         self.method = method
@@ -441,6 +448,7 @@ class BaseMoEWrapper(_MoEBase, ABC):
                 input_tensor_cpu[current_slot].data_ptr(),
                 output_cpu[current_slot].data_ptr(),
                 incremental,
+                self._allow_inline_empty,
             ),
         )
 

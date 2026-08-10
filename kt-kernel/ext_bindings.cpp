@@ -231,22 +231,53 @@ class MOEBindings {
       intptr_t input;
       intptr_t output;
       bool incremental;
+      // Caller asserts this submit may be completed inline when the batch
+      // turns out to route entirely to GPU-resident experts.  See inner().
+      bool allow_inline_empty;
     };
+    // Runs as a CUDA host node, i.e. at every graph replay, where no Python
+    // executes.  This is the only place a per-batch decision can still be
+    // made for captured decode.
     static void inner(void* args) {
       Args* args_ = (Args*)args;
+      if (args_->allow_inline_empty && !args_->incremental) {
+        const int qlen = *(const int*)args_->qlen;
+        if (!args_->moe->batch_has_cpu_expert(qlen, args_->k, (const int64_t*)args_->expert_ids)) {
+          // Nothing routed here belongs to the CPU, so the forward would
+          // write exactly zeros.  Do that inline on the callback thread and
+          // return: no enqueue, so no worker wake, no signal, and the paired
+          // sync finds nothing of ours outstanding.  The zero-fill is
+          // mandatory -- the H2D copy and the GPU merge-add are unconditional
+          // nodes in the captured graph, and the slot still holds the
+          // previous step's contribution (buffer_depth == 2).
+          std::memset((void*)args_->output, 0, args_->moe->output_bytes(qlen));
+          args_->moe->inline_empty_forwards.fetch_add(1, std::memory_order_relaxed);
+          return;
+        }
+      }
       args_->cpuinfer->enqueue(&TP_MOE<T>::forward_binding, args_->moe, args_->qlen, args_->k, args_->expert_ids,
                                args_->weights, args_->input, args_->output, args_->incremental);
     }
+    // Three explicit arities (no default arguments): pybind's overload_cast
+    // selects on the exact signature, so a defaulted parameter would fold the
+    // shorter forms away and fail to resolve.
     static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<TP_MOE<T>> moe, intptr_t qlen, int k,
                                                             intptr_t expert_ids, intptr_t weights, intptr_t input,
-                                                            intptr_t output, bool incremental = false) {
-      Args* args = new Args{nullptr, moe.get(), qlen, k, expert_ids, weights, input, output, incremental};
+                                                            intptr_t output, bool incremental,
+                                                            bool allow_inline_empty) {
+      Args* args =
+          new Args{nullptr, moe.get(), qlen, k, expert_ids, weights, input, output, incremental, allow_inline_empty};
       return std::make_pair((intptr_t)&inner, (intptr_t)args);
     }
     static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<TP_MOE<T>> moe, intptr_t qlen, int k,
                                                             intptr_t expert_ids, intptr_t weights, intptr_t input,
+                                                            intptr_t output, bool incremental) {
+      return cpuinfer_interface(moe, qlen, k, expert_ids, weights, input, output, incremental, false);
+    }
+    static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<TP_MOE<T>> moe, intptr_t qlen, int k,
+                                                            intptr_t expert_ids, intptr_t weights, intptr_t input,
                                                             intptr_t output) {
-      return cpuinfer_interface(moe, qlen, k, expert_ids, weights, input, output, false);
+      return cpuinfer_interface(moe, qlen, k, expert_ids, weights, input, output, false, false);
     }
   };
 };
@@ -463,6 +494,11 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
       .def("forward_task",
            py::overload_cast<std::shared_ptr<MoeClass>, intptr_t, int, intptr_t, intptr_t, intptr_t, intptr_t, bool>(
                &MoeBindings::ForwardBindings::cpuinfer_interface))
+      .def("forward_task",
+           py::overload_cast<std::shared_ptr<MoeClass>, intptr_t, int, intptr_t, intptr_t, intptr_t, intptr_t, bool,
+                             bool>(&MoeBindings::ForwardBindings::cpuinfer_interface))
+      .def("inline_empty_forwards",
+           [](MoeClass& self) { return self.inline_empty_forwards.load(std::memory_order_relaxed); })
       .def("warm_up", &MoeClass::warm_up)
       .def("load_weights", &MoeClass::load_weights)
       .def("forward", &MoeClass::forward_binding);

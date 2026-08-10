@@ -3,6 +3,7 @@
 
 // #define CHECK
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <type_traits>
@@ -44,6 +45,10 @@ class TP_MOE_Common : public MoE_Interface {
 #endif
  public:
   GeneralMOEConfig config;
+  // Count of forwards completed inline because the batch routed entirely to
+  // GPU-resident experts (see the forward binding's host callback). Written
+  // from the CUDA host-callback thread, read from Python for telemetry.
+  std::atomic<uint64_t> inline_empty_forwards{0};
   using input_t = typename T::input_t;
   TP_MOE_Common(const GeneralMOEConfig& config) : config(config) {
     printf("TP MOE layer %d, pool: 0x%lx, expert num: %d, num_experts_per_tok: %d\n", config.layer_idx,
@@ -172,6 +177,30 @@ class TP_MOE_Common : public MoE_Interface {
     forward((int*)qlen_ptr, k, (const int64_t*)expert_ids, (const float*)weights, (const void*)input, (void*)output,
             incremental);
   }
+
+  // True if any routed slot in this batch names an expert this CPU instance
+  // owns.  Used by the forward binding's host callback to decide whether the
+  // forward is worth waking the worker thread for: under GPU-preferred
+  // (margin) routing almost every layer-step routes entirely to GPU-resident
+  // experts, and the enqueue -> wake -> run -> signal round trip then costs
+  // far more than the empty work it carries.  Cheap: qlen*k mask lookups,
+  // no allocation, no locks.
+  bool batch_has_cpu_expert(int qlen, int k, const int64_t* expert_ids) const {
+    if (expert_ids == nullptr || config.gpu_experts_mask == nullptr) {
+      return true;  // nothing to prove it is empty -> take the normal path
+    }
+    const long total = (long)qlen * (long)k;
+    for (long i = 0; i < total; ++i) {
+      if (!config.should_skip_expert(expert_ids[i])) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Bytes a forward writes into the caller's output buffer: [qlen, hidden]
+  // bf16, matching the ggml_bf16_t stores in merge_results().
+  size_t output_bytes(int qlen) const { return (size_t)qlen * (size_t)config.hidden_size * sizeof(uint16_t); }
 
   void forward(int* qlen_ptr, int k, const int64_t* expert_ids, const float* weights, const void* input, void* output,
                bool incremental) {
