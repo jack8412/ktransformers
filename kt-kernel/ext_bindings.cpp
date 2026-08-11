@@ -862,6 +862,11 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
       .def_readwrite("pool", &GeneralMOEConfig::pool)
 
       .def_readonly("num_gpu_experts", &GeneralMOEConfig::num_gpu_experts)
+      // Must be set BEFORE the MoE is constructed: the per-expert weight
+      // buffers are allocated in AMX_MOE_BASE::init(), so a value assigned
+      // afterwards would silently allocate the full 1.45 TB and look like the
+      // feature simply did not help.
+      .def_readwrite("cold_only_cpu_experts", &GeneralMOEConfig::cold_only_cpu_experts)
       .def_property(
           "gpu_experts_mask",
           [](const GeneralMOEConfig& self) { return reinterpret_cast<uintptr_t>(self.gpu_experts_mask); },

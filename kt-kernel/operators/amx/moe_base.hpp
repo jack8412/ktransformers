@@ -117,6 +117,25 @@ class AMX_MOE_BASE {
       down_ba_.push_back(make_buffer_a(config_.max_len, config_.intermediate_size, nullptr));
       down_bc_.push_back(make_buffer_c(config_.max_len, config_.hidden_size, nullptr));
 
+      // Cold-only residency: an expert this CPU never serves gets no weight
+      // storage. The vectors stay EXPERT-INDEXED -- one shared_ptr per expert
+      // is nothing, and position == expert id is what every consumer assumes
+      // -- so nothing downstream needs a slot translation. The entries are
+      // simply null.
+      //
+      // Reaching a null here is a null dereference, not a silent read of
+      // another expert's weights, and that is deliberate: the forward only
+      // reaches these through m_expert_id_map_, which is filled exclusively
+      // from ids that passed should_skip_expert (moe_base.hpp:203/304/411/
+      // 458/615). If that invariant ever breaks it should crash rather than
+      // serve plausible wrong numbers.
+      if (!config_.holds_expert_weights((int64_t)i)) {
+        gate_bb_.push_back(nullptr);
+        up_bb_.push_back(nullptr);
+        down_bb_.push_back(nullptr);
+        continue;
+      }
+
       void* gate_bb_ptr =
           std::aligned_alloc(64, buffer_b_required_size(config_.intermediate_size, config_.hidden_size));
       gate_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.hidden_size, gate_bb_ptr));

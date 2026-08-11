@@ -250,6 +250,7 @@ class BaseMoEWrapper(_MoEBase, ABC):
         numa_nodes: Optional[List[int]] = None,
         swiglu_limit: float = 0.0,
         situ_beta: float = 0.0,
+        cold_only_cpu_experts: bool = False,
         situ_linear_beta: float = 0.0,
     ):
         """
@@ -321,6 +322,9 @@ class BaseMoEWrapper(_MoEBase, ABC):
         # Written into MOEConfig by the concrete wrappers and consumed by
         # amx::act_fn / avx2::act_fn. See GeneralMOEConfig in operators/common.hpp.
         self.situ_beta = float(situ_beta)
+        # Hold weights only for experts this CPU actually serves. Read at
+        # MOEConfig construction, before the buffers are allocated.
+        self.cold_only_cpu_experts = bool(cold_only_cpu_experts)
         self.situ_linear_beta = float(situ_linear_beta)
 
         # Initialize CPU inference engine (singleton via shared base class)

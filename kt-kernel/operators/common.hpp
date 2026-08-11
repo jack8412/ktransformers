@@ -257,6 +257,24 @@ struct GeneralMOEConfig {
     return expert_id < 0 || expert_id >= expert_num || (gpu_experts_mask && gpu_experts_mask[expert_id]);
   }
 
+  // Cold-only residency: hold weights ONLY for experts this CPU actually
+  // serves. Off by default, because the buffers a GPU-resident expert never
+  // reads are still READ by the full-GPU prefill fallback and the layerwise
+  // prefill manager, which export them to the device. Those are refused under
+  // margin routing, which is the configuration this is gated to.
+  //
+  // Worth ~1 TB on Kimi-K3: 896 experts x 92 layers x ~17.55 MB = 1.45 TB
+  // allocated, against ~447 GB actually served at 620/896 resident.
+  bool cold_only_cpu_experts = false;
+
+  // True if this CPU instance stores this expert's weights at all. Distinct
+  // from should_skip_expert, which asks whether to COMPUTE it: with cold-only
+  // off, every expert is stored and only some are computed.
+  inline bool holds_expert_weights(int64_t expert_id) const {
+    if (!cold_only_cpu_experts) return true;
+    return !(gpu_experts_mask && expert_id >= 0 && expert_id < expert_num && gpu_experts_mask[expert_id]);
+  }
+
   void* gate_proj = nullptr;
   void* up_proj = nullptr;
   void* down_proj = nullptr;

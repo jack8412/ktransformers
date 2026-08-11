@@ -270,6 +270,7 @@ class AMXMoEWrapper(BaseMoEWrapper):
         method: str = "AMXINT4",
         numa_nodes: Optional[List[int]] = None,
         situ_beta: float = 0.0,
+        cold_only_cpu_experts: bool = False,
         situ_linear_beta: float = 0.0,
     ):
         """
@@ -323,6 +324,7 @@ class AMXMoEWrapper(BaseMoEWrapper):
             method=method,
             numa_nodes=numa_nodes,
             situ_beta=situ_beta,
+            cold_only_cpu_experts=cold_only_cpu_experts,
             situ_linear_beta=situ_linear_beta,
         )
 
@@ -376,6 +378,10 @@ class AMXMoEWrapper(BaseMoEWrapper):
             self.moe_intermediate_size,
             self.gpu_experts_mask.data_ptr(),
         )
+        # Set BEFORE the MoE is constructed: per-expert weight buffers are
+        # allocated in AMX_MOE_BASE::init(), so assigning this afterwards would
+        # silently allocate everything and look like the feature did nothing.
+        moe_config.cold_only_cpu_experts = self.cold_only_cpu_experts
         moe_config.layer_idx = self.layer_idx
         moe_config.pool = self.cpu_infer.backend_
         moe_config.max_len = self.chunked_prefill_size
@@ -493,6 +499,10 @@ class AMXMoEWrapper(BaseMoEWrapper):
             self.moe_intermediate_size,
             self.gpu_experts_mask.data_ptr(),
         )
+        # Set BEFORE the MoE is constructed: per-expert weight buffers are
+        # allocated in AMX_MOE_BASE::init(), so assigning this afterwards would
+        # silently allocate everything and look like the feature did nothing.
+        moe_config.cold_only_cpu_experts = self.cold_only_cpu_experts
         moe_config.layer_idx = self.layer_idx
         moe_config.pool = self.cpu_infer.backend_
         moe_config.max_len = self.chunked_prefill_size
@@ -578,6 +588,7 @@ class NativeMoEWrapper(BaseMoEWrapper):
         swiglu_limit: float = 0.0,
         swiglu_alpha: float = 0.0,
         situ_beta: float = 0.0,
+        cold_only_cpu_experts: bool = False,
         situ_linear_beta: float = 0.0,
     ):
         self._swiglu_alpha = float(swiglu_alpha)
@@ -673,6 +684,7 @@ class NativeMoEWrapper(BaseMoEWrapper):
             numa_nodes=numa_nodes,
             swiglu_limit=swiglu_limit,
             situ_beta=situ_beta,
+            cold_only_cpu_experts=cold_only_cpu_experts,
             situ_linear_beta=situ_linear_beta,
         )
 
@@ -860,6 +872,10 @@ class NativeMoEWrapper(BaseMoEWrapper):
             self.moe_intermediate_size,
             self.gpu_experts_mask.data_ptr(),
         )
+        # Set BEFORE the MoE is constructed: per-expert weight buffers are
+        # allocated in AMX_MOE_BASE::init(), so assigning this afterwards would
+        # silently allocate everything and look like the feature did nothing.
+        moe_config.cold_only_cpu_experts = self.cold_only_cpu_experts
         moe_config.layer_idx = self.layer_idx
         moe_config.pool = self.cpu_infer.backend_
         moe_config.max_len = self.chunked_prefill_size

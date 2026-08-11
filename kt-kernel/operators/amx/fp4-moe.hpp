@@ -580,6 +580,10 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
           uint64_t expert_idx = task_id / nth;
           uint64_t logical_expert_id = expert_map(physical_to_logical_map, expert_idx);
           int ith = task_id % nth;
+          // Cold-only residency left this expert unallocated. Skipping is not
+          // just null-safety: this loop is 75% of the 202 s startup, and
+          // filling a buffer nothing reads is the bulk of it.
+          if (gate_bb_[expert_idx] == nullptr) return;
           gate_bb_[expert_idx]->from_raw_mat(
               (uint8_t*)config_.gate_proj +
                   ((logical_expert_id * config_.intermediate_size * config_.hidden_size) >> 1),
@@ -610,6 +614,8 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
           uint64_t expert_idx = task_id;
           uint64_t logical_expert_id = expert_map(physical_to_logical_map, expert_idx);
           size_t scale_elem_count = (config_.hidden_size * config_.intermediate_size) / config_.quant_config.group_size;
+          // Unallocated under cold-only residency; see the weight loop above.
+          if (gate_bb_[expert_idx] == nullptr) return;
           // E8M0 codes stay resident as raw bytes; the kernels expand them.
           std::memcpy(gate_bb_[expert_idx]->d, (const uint8_t*)config_.gate_scale + (logical_expert_id * scale_elem_count),
                       scale_elem_count);
