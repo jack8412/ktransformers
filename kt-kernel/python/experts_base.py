@@ -529,24 +529,50 @@ class BaseMoEWrapper(_MoEBase, ABC):
         enqueue creates. Returns the pointers the poller was registered with,
         so the caller can assert they match the slot's registration.
         """
+        self.pack_forward_inputs(hidden_states, topk_ids, topk_weights)
+        self.flush_forward_inputs(hidden_states)
+        # Same addresses the slot was REGISTERED with, by construction: both
+        # go through doorbell_ptrs. If staging and registration could compute
+        # them independently they could drift, and the poller would read a
+        # buffer nothing writes.
+        return self.doorbell_ptrs(hidden_states)
+
+    def pack_forward_inputs(self, hidden_states, topk_ids, topk_weights):
+        """Device-side pack of activations, ids and weights into one block.
+
+        Issue this on the MAIN stream, BEFORE forking to the CPU stream. Per
+        layer, the expert GEMM ends ~20 us in while the layer runs ~145 us, so
+        whatever sits on the CPU stream ahead of the ring decides whether the
+        dispatch lands while the GEMM is still running or after it has already
+        finished. Measured: the staging copy completed AFTER the GEMM on 52%
+        of layers, and a late dispatch exposes the entire CPU latency because
+        there is no longer any GPU work to hide behind.
+
+        Three device-to-device copies of a few tens of KB are cheap here and
+        ruinous on the critical path.
+        """
         flat = hidden_states.view(-1, hidden_states.shape[-1])
-        gpu, cpu, offsets, (bs, h, k) = KExpertsCPUBuffer.get_packed(
+        gpu, _cpu, offsets, (bs, h, k) = KExpertsCPUBuffer.get_packed(
             flat, self.num_experts_per_tok
         )
         slot = self.layer_idx % KExpertsCPUBuffer.buffer_depth
         in_off, ids_off, w_off = offsets
         g = gpu[slot]
-        # Pack on the DEVICE, then one D2H. Three device-to-device copies of a
-        # few tens of KB cost far less than the two extra host transfers they
-        # replace -- the profile showed the device going idle right after these.
         g[in_off:ids_off].view(torch.bfloat16).view(bs, h).copy_(flat)
         g[ids_off:w_off].view(torch.int64).view(bs, k).copy_(topk_ids)
         g[w_off:].view(torch.float32).view(bs, k).copy_(topk_weights)
-        cpu[slot].copy_(g, non_blocking=True)
-        # Same addresses the slot was REGISTERED with, by construction: both
-        # go through doorbell_ptrs. If staging and registration could compute
-        # them independently they could drift, and the poller would read a
-        # buffer nothing writes.
+
+    def flush_forward_inputs(self, hidden_states):
+        """The single D2H that makes this step's batch visible to the poller.
+
+        The ONLY thing that should sit between the fork and the ring.
+        """
+        flat = hidden_states.view(-1, hidden_states.shape[-1])
+        gpu, cpu, _offsets, _shape = KExpertsCPUBuffer.get_packed(
+            flat, self.num_experts_per_tok
+        )
+        slot = self.layer_idx % KExpertsCPUBuffer.buffer_depth
+        cpu[slot].copy_(gpu[slot], non_blocking=True)
         return self.doorbell_ptrs(hidden_states)
 
     def doorbell_ptrs(self, hidden_states):
