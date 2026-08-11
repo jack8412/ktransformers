@@ -469,6 +469,67 @@ class BaseMoEWrapper(_MoEBase, ABC):
             )
             BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = True
 
+    def stage_forward_inputs(self, hidden_states, topk_ids, topk_weights):
+        """Staging half of submit_forward, without the enqueue.
+
+        The doorbell transport still needs this step's activations and ids in
+        the kt rings -- the poller reads exactly those -- but must NOT enqueue
+        a task, because the whole point is to remove the cross-thread hop the
+        enqueue creates. Returns the pointers the poller was registered with,
+        so the caller can assert they match the slot's registration.
+        """
+        flat = hidden_states.view(-1, hidden_states.shape[-1])
+        (
+            input_tensor_cpu, immediate_ids_cpu, _deferred_ids_cpu, weights_cpu,
+            output_cpu, bsz_tensor_cpu, _output_gpu,
+        ) = KExpertsCPUBuffer.get_buffer(flat, self.num_experts_per_tok)
+        slot = self.layer_idx % KExpertsCPUBuffer.buffer_depth
+        input_tensor_cpu[slot].copy_(flat, non_blocking=True)
+        weights_cpu[slot].copy_(topk_weights, non_blocking=True)
+        immediate_ids_cpu[slot].copy_(topk_ids.to(torch.long), non_blocking=True)
+        return {
+            "qlen_ptr": bsz_tensor_cpu[slot].data_ptr(),
+            "k": immediate_ids_cpu[slot].size(-1),
+            "expert_ids": immediate_ids_cpu[slot].data_ptr(),
+            "weights": weights_cpu[slot].data_ptr(),
+            "input": input_tensor_cpu[slot].data_ptr(),
+            "output": output_cpu[slot].data_ptr(),
+        }
+
+    def register_doorbell_slot(self, slot_index: int, hidden_states, topk_ids):
+        """Bind a doorbell slot to THIS batch size's rings.
+
+        Must be called once per (layer, batch size): KExpertsCPUBuffer keys its
+        rings by batch size, so a closure registered for one size would have
+        the poller read and write another size's buffers -- silently, since the
+        shapes are identical. Registration is a host-side operation and
+        allocates nothing, so it is safe to do on the first forward of a tier
+        even while that tier's graph is being captured.
+        """
+        ptrs = self.stage_forward_inputs(hidden_states, topk_ids, topk_ids.new_zeros(
+            topk_ids.shape, dtype=torch.float32))
+        self.moe.register_doorbell(
+            slot_index, ptrs["qlen_ptr"], ptrs["k"], ptrs["expert_ids"],
+            ptrs["weights"], ptrs["input"], ptrs["output"],
+            False, self._allow_inline_empty, self.cpu_infer,
+        )
+        return ptrs
+
+    def doorbell_output(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Result of the poller's forward, moved to device for the merge.
+
+        The GPU wait node has already ordered this: it does not return until
+        the poller published `completion`, which it does with release ordering
+        after writing the output buffer.
+        """
+        flat = hidden_states.view(-1, hidden_states.shape[-1])
+        (_i, _ii, _di, _w, output_cpu, _b, output_gpu) = KExpertsCPUBuffer.get_buffer(
+            flat, self.num_experts_per_tok
+        )
+        slot = self.layer_idx % KExpertsCPUBuffer.buffer_depth
+        output_gpu.copy_(output_cpu[slot], non_blocking=True)
+        return output_gpu
+
     def sync_forward(self, hidden_states: torch.Tensor, cuda_stream) -> torch.Tensor:
         """
         Synchronize and retrieve forward inference results.
