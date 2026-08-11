@@ -564,6 +564,67 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     }
   }
 
+  /// \brief Hand one expert's weight buffers to another and refill them.
+  ///
+  /// Cold-only residency holds a BufferB only for experts this CPU serves, so
+  /// a swap that DEMOTES a GPU expert to the CPU finds no buffer there. Swaps
+  /// are 1:1, so the promoted expert's storage is exactly what the demoted one
+  /// needs: this moves the three shared_ptrs rather than allocating, which
+  /// keeps the CPU-held count -- and therefore RSS -- invariant for the life
+  /// of the process.
+  ///
+  /// `gate`/`up`/`down` and their scales are the FULL (unsliced) expert as it
+  /// sits in the checkpoint. The NUMA slicing below mirrors the bulk load
+  /// exactly: gate and up are row slices, down is column-strided.
+  void install_expert_from_raw(int promote_id, int demote_id, intptr_t gate, intptr_t up, intptr_t down,
+                               intptr_t gate_scale, intptr_t up_scale, intptr_t down_scale, int full_intermediate) {
+    const int group_size = config_.quant_config.group_size;
+    const size_t H = config_.hidden_size;
+    const size_t I = config_.intermediate_size;  // this partition's share
+    const size_t wec = I * H;                    // elements, nibble-packed
+    const size_t sec = (H / group_size) * I;     // scale bytes for gate/up
+    const size_t i = (size_t)tp_part_idx;
+
+    if (gate_bb_[promote_id] == nullptr)
+      throw std::runtime_error("install_expert_from_raw: promoted expert holds no CPU buffer");
+    if (gate_bb_[demote_id] != nullptr)
+      throw std::runtime_error("install_expert_from_raw: demoted expert already holds a CPU buffer");
+
+    gate_bb_[demote_id] = std::move(gate_bb_[promote_id]);
+    up_bb_[demote_id] = std::move(up_bb_[promote_id]);
+    down_bb_[demote_id] = std::move(down_bb_[promote_id]);
+    gate_bb_[promote_id] = nullptr;
+    up_bb_[promote_id] = nullptr;
+    down_bb_[promote_id] = nullptr;
+
+    // from_raw_mat wants a contiguous source, and the staging arenas are
+    // released after the bulk load, so slice into a scratch buffer. One
+    // expert of one partition, on a path that runs a handful of times per
+    // swap window -- not worth an arena.
+    std::vector<uint8_t> tmp(wec >> 1);
+
+    std::memcpy(tmp.data(), (const uint8_t*)gate + ((i * wec) >> 1), wec >> 1);
+    gate_bb_[demote_id]->from_raw_mat(tmp.data(), 0, 1);
+    std::memcpy(tmp.data(), (const uint8_t*)up + ((i * wec) >> 1), wec >> 1);
+    up_bb_[demote_id]->from_raw_mat(tmp.data(), 0, 1);
+
+    // down is [hidden, intermediate]: each column carries this partition's
+    // slice of the full intermediate dimension.
+    for (size_t col = 0; col < H; col++) {
+      std::memcpy(tmp.data() + ((col * I) >> 1),
+                  (const uint8_t*)down + (((col * (size_t)full_intermediate) + i * I) >> 1), I >> 1);
+    }
+    down_bb_[demote_id]->from_raw_mat(tmp.data(), 0, 1);
+
+    std::memcpy(gate_bb_[demote_id]->d, (const uint8_t*)gate_scale + i * sec, sec);
+    std::memcpy(up_bb_[demote_id]->d, (const uint8_t*)up_scale + i * sec, sec);
+    const size_t per_col = I / group_size;
+    for (size_t col = 0; col < H; col++) {
+      std::memcpy(down_bb_[demote_id]->d + col * per_col,
+                  (const uint8_t*)down_scale + (col * ((size_t)full_intermediate / group_size) + i * per_col), per_col);
+    }
+  }
+
   void load_weights() {
     auto& quant_config = config_.quant_config;
     const uint64_t* physical_to_logical_map = (const uint64_t*)config_.physical_to_logical_map;
@@ -956,6 +1017,27 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
     });
 
     this->weights_loaded = true;
+  }
+
+  /// \brief Move a promoted expert's CPU buffers to a demoted one and refill.
+  ///
+  /// The piece that lets cold-only residency and expert swapping run together.
+  /// Without it a demotion points the forward at a null buffer, so the two
+  /// features are refused in combination at config time.
+  ///
+  /// Neither allocates nor frees: swaps are 1:1, so the CPU-held count stays
+  /// invariant and RSS stays flat. Runs on the CPUInfer TaskQueue, which the
+  /// backend mutex makes mutually exclusive with poller forwards, and the swap
+  /// window has already quiesced at a forward boundary.
+  void swap_expert_slot(int promote_id, int demote_id, intptr_t gate, intptr_t up, intptr_t down,
+                        intptr_t gate_scale, intptr_t up_scale, intptr_t down_scale) {
+    if (!this->weights_loaded) throw std::runtime_error("Not Loaded");
+    if (this->tps.empty()) throw std::runtime_error("No TP parts initialized");
+    const int full_intermediate = this->config.intermediate_size;
+    this->config.pool->dispense_backend()->do_numa_job([&, this](int i) {
+      this->tps[i]->install_expert_from_raw(promote_id, demote_id, gate, up, down, gate_scale, up_scale, down_scale,
+                                            full_intermediate);
+    });
   }
 
   void write_weight_scale_to_buffer(int gpu_tp_count, int expert_id, const std::vector<uintptr_t>& w13_weight_ptrs,

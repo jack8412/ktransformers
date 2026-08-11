@@ -1111,3 +1111,44 @@ class NativeMoEWrapper(BaseMoEWrapper):
         """
         # The CPUInfer.sync() call blocks until pending tasks complete.
         self.cpu_infer.sync()
+
+    def swap_expert_slot(
+        self,
+        promote_id: int,
+        demote_id: int,
+        gate: int,
+        up: int,
+        down: int,
+        gate_scale: int,
+        up_scale: int,
+        down_scale: int,
+    ):
+        """Hand a promoted expert's CPU buffers to a demoted one and refill them.
+
+        Cold-only residency holds a weight buffer only for experts this CPU
+        serves, so a swap that DEMOTES a GPU expert finds none. Swaps are 1:1,
+        so the promoted expert's storage is exactly what the demoted one needs:
+        this moves the buffers rather than allocating, keeping the CPU-held
+        count -- and RSS -- invariant.
+
+        The pointers are the FULL, unsliced expert as it sits in the
+        checkpoint; kt slices across its NUMA partitions internally, exactly as
+        the bulk load does.
+
+        Blocking: the swap window has already quiesced at a forward boundary,
+        and serving must not resume until the demoted expert's weights are
+        actually present.
+        """
+        if self.moe is None:
+            raise RuntimeError("MoE instance not initialized; cannot swap expert slot.")
+        if not hasattr(self.moe, "swap_expert_slot_task"):
+            raise NotImplementedError(
+                "swap_expert_slot_task is not available for this backend; "
+                "cold-only residency with expert swapping needs it."
+            )
+        self.cpu_infer.submit(
+            self.moe.swap_expert_slot_task(
+                promote_id, demote_id, gate, up, down, gate_scale, up_scale, down_scale
+            )
+        )
+        self.cpu_infer.sync()

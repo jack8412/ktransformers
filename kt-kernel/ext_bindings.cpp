@@ -633,6 +633,41 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
                 py::arg("gpu_tp_count"), py::arg("expert_id"), py::arg("w13_weight_ptrs"), py::arg("w13_scale_ptrs"),
                 py::arg("w2_weight_ptrs"), py::arg("w2_scale_ptrs"));
   }
+
+  // Cold-only residency + swapping: hand a promoted expert's CPU buffers to
+  // the expert being demoted, and refill them from the checkpoint. Enqueued
+  // like every other kt entry point, so the backend mutex keeps it mutually
+  // exclusive with poller forwards.
+  if constexpr (requires { &MoeClass::swap_expert_slot; }) {
+    struct SwapExpertSlotBindings {
+      struct Args {
+        CPUInfer* cpuinfer;
+        MoeClass* moe;
+        int promote_id;
+        int demote_id;
+        intptr_t gate, up, down, gate_scale, up_scale, down_scale;
+      };
+
+      static void inner(void* args) {
+        Args* a = (Args*)args;
+        a->cpuinfer->enqueue(&MoeClass::swap_expert_slot, a->moe, a->promote_id, a->demote_id, a->gate, a->up, a->down,
+                             a->gate_scale, a->up_scale, a->down_scale);
+      }
+
+      static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<MoeClass> moe, int promote_id,
+                                                              int demote_id, intptr_t gate, intptr_t up, intptr_t down,
+                                                              intptr_t gate_scale, intptr_t up_scale,
+                                                              intptr_t down_scale) {
+        Args* args = new Args{nullptr, moe.get(), promote_id, demote_id, gate, up, down, gate_scale, up_scale,
+                              down_scale};
+        return std::make_pair((intptr_t)&inner, (intptr_t)args);
+      }
+    };
+
+    moe_cls.def("swap_expert_slot_task", &SwapExpertSlotBindings::cpuinfer_interface, py::arg("promote_id"),
+                py::arg("demote_id"), py::arg("gate"), py::arg("up"), py::arg("down"), py::arg("gate_scale"),
+                py::arg("up_scale"), py::arg("down_scale"));
+  }
 }
 
 PYBIND11_MODULE(kt_kernel_ext, m) {
