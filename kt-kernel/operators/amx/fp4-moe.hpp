@@ -659,8 +659,10 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
                                      intptr_t up_scale, intptr_t down_scale, int full_intermediate) {
     if (gate_bb_[expert_id] == nullptr) throw std::runtime_error("verify: expert is not CPU-resident here");
 
-    const size_t gu_bytes = buffer_b_required_size(config_.intermediate_size, config_.hidden_size);
-    const size_t d_bytes = buffer_b_required_size(config_.hidden_size, config_.intermediate_size);
+    // this-> required: dependent base member, invisible to unqualified
+    // two-phase lookup from the derived template.
+    const size_t gu_bytes = this->buffer_b_required_size(config_.intermediate_size, config_.hidden_size);
+    const size_t d_bytes = this->buffer_b_required_size(config_.hidden_size, config_.intermediate_size);
 
     void* g = std::aligned_alloc(64, gu_bytes);
     void* u = std::aligned_alloc(64, gu_bytes);
