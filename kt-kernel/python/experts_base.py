@@ -85,6 +85,53 @@ class KExpertsCPUBuffer:
     temp_buffer: tuple = tuple()
     buffer_depth: int = 2
 
+    # Packed staging: one pinned buffer holding activations, ids and weights
+    # back to back, so a layer's staging is ONE D2H instead of three.
+    #
+    # The three copies exist only because they are three tensors -- the bytes
+    # are small (activations dominate at ~57 KB, ids and weights are ~1 KB
+    # each) so the launches, not the volume, are the cost. Decode profiling
+    # measured 277 Memcpy DtoH per step across 92 layers, and the device goes
+    # idle immediately after them.
+    packed_buffers: Dict = dict()
+
+    @classmethod
+    def get_packed(cls, hidden_states: torch.Tensor, num_experts_per_tok):
+        """(gpu_staging, cpu_pinned, offsets) for this batch size.
+
+        offsets is (input_off, ids_off, weights_off) in BYTES; the caller hands
+        those addresses to kt, which reads each region exactly as it read the
+        three separate buffers -- so nothing on the C++ side changes.
+        """
+        bs = hidden_states.shape[0]
+        h = hidden_states.shape[-1]
+        k = num_experts_per_tok
+        hit = cls.packed_buffers.get(bs)
+        if hit is not None:
+            return hit
+
+        # bf16 activations, int64 ids, fp32 weights. 8-byte alignment for the
+        # int64 region is automatic here: the activation block is bs*h*2 bytes
+        # and h is a multiple of 4 for every K3 shape.
+        in_bytes = bs * h * 2
+        ids_bytes = bs * k * 8
+        w_bytes = bs * k * 4
+        total = in_bytes + ids_bytes + w_bytes
+        offsets = (0, in_bytes, in_bytes + ids_bytes)
+
+        gpu = [
+            torch.empty(total, dtype=torch.uint8, device=hidden_states.device)
+            for _ in range(cls.buffer_depth)
+        ]
+        cpu = [
+            torch.empty(total, dtype=torch.uint8, device="cpu", pin_memory=True)
+            for _ in range(cls.buffer_depth)
+        ]
+        entry = (gpu, cpu, offsets, (bs, h, k))
+        if bs in cls.capture_bs:
+            cls.packed_buffers[bs] = entry
+        return entry
+
     @classmethod
     def get_buffer(cls, hidden_states: torch.Tensor, num_experts_per_tok):
         hidden_size = hidden_states.shape[-1]
@@ -483,22 +530,24 @@ class BaseMoEWrapper(_MoEBase, ABC):
         so the caller can assert they match the slot's registration.
         """
         flat = hidden_states.view(-1, hidden_states.shape[-1])
-        (
-            input_tensor_cpu, immediate_ids_cpu, _deferred_ids_cpu, weights_cpu,
-            output_cpu, bsz_tensor_cpu, _output_gpu,
-        ) = KExpertsCPUBuffer.get_buffer(flat, self.num_experts_per_tok)
+        gpu, cpu, offsets, (bs, h, k) = KExpertsCPUBuffer.get_packed(
+            flat, self.num_experts_per_tok
+        )
         slot = self.layer_idx % KExpertsCPUBuffer.buffer_depth
-        input_tensor_cpu[slot].copy_(flat, non_blocking=True)
-        weights_cpu[slot].copy_(topk_weights, non_blocking=True)
-        immediate_ids_cpu[slot].copy_(topk_ids.to(torch.long), non_blocking=True)
-        return {
-            "qlen_ptr": bsz_tensor_cpu[slot].data_ptr(),
-            "k": immediate_ids_cpu[slot].size(-1),
-            "expert_ids": immediate_ids_cpu[slot].data_ptr(),
-            "weights": weights_cpu[slot].data_ptr(),
-            "input": input_tensor_cpu[slot].data_ptr(),
-            "output": output_cpu[slot].data_ptr(),
-        }
+        in_off, ids_off, w_off = offsets
+        g = gpu[slot]
+        # Pack on the DEVICE, then one D2H. Three device-to-device copies of a
+        # few tens of KB cost far less than the two extra host transfers they
+        # replace -- the profile showed the device going idle right after these.
+        g[in_off:ids_off].view(torch.bfloat16).view(bs, h).copy_(flat)
+        g[ids_off:w_off].view(torch.int64).view(bs, k).copy_(topk_ids)
+        g[w_off:].view(torch.float32).view(bs, k).copy_(topk_weights)
+        cpu[slot].copy_(g, non_blocking=True)
+        # Same addresses the slot was REGISTERED with, by construction: both
+        # go through doorbell_ptrs. If staging and registration could compute
+        # them independently they could drift, and the poller would read a
+        # buffer nothing writes.
+        return self.doorbell_ptrs(hidden_states)
 
     def doorbell_ptrs(self, hidden_states):
         """Ring pointers for THIS batch size, without copying anything.
@@ -508,19 +557,27 @@ class BaseMoEWrapper(_MoEBase, ABC):
         a captured tier can be inside graph capture, where a copy is recorded
         rather than executed -- so anything staged at registration time is not
         actually in the ring.
+
+        Activations, ids and weights come from ONE packed pinned buffer, so
+        the layer stages with a single D2H. kt reads each region at its own
+        address exactly as before -- the packing is invisible to it.
         """
         flat = hidden_states.view(-1, hidden_states.shape[-1])
         (
-            input_tensor_cpu, immediate_ids_cpu, _deferred_ids_cpu, weights_cpu,
-            output_cpu, bsz_tensor_cpu, _output_gpu,
+            _i, _ii, _di, _w, output_cpu, bsz_tensor_cpu, _output_gpu,
         ) = KExpertsCPUBuffer.get_buffer(flat, self.num_experts_per_tok)
+        _gpu, cpu, offsets, _shape = KExpertsCPUBuffer.get_packed(
+            flat, self.num_experts_per_tok
+        )
         slot = self.layer_idx % KExpertsCPUBuffer.buffer_depth
+        base = cpu[slot].data_ptr()
+        in_off, ids_off, w_off = offsets
         return {
             "qlen_ptr": bsz_tensor_cpu[slot].data_ptr(),
-            "k": immediate_ids_cpu[slot].size(-1),
-            "expert_ids": immediate_ids_cpu[slot].data_ptr(),
-            "weights": weights_cpu[slot].data_ptr(),
-            "input": input_tensor_cpu[slot].data_ptr(),
+            "k": self.num_experts_per_tok,
+            "expert_ids": base + ids_off,
+            "weights": base + w_off,
+            "input": base + in_off,
             "output": output_cpu[slot].data_ptr(),
         }
 
@@ -654,6 +711,7 @@ class BaseMoEWrapper(_MoEBase, ABC):
         to reset the buffer state or free memory.
         """
         KExpertsCPUBuffer.capture_buffers.clear()
+        KExpertsCPUBuffer.packed_buffers.clear()
         KExpertsCPUBuffer.temp_bs = 0
         KExpertsCPUBuffer.temp_buffer = tuple()
 
