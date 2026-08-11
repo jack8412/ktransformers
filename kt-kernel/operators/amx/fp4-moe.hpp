@@ -601,6 +601,10 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
           uint64_t expert_idx = task_id / nth;
           uint64_t logical_expert_id = expert_map(physical_to_logical_map, expert_idx);
           int ith = task_id % nth;
+          // Down is a SEPARATE work-stealing job from gate/up above -- three
+          // loops in this function, not two. Missing this one segfaulted at
+          // startup on the first cold-only run.
+          if (down_bb_[expert_idx] == nullptr) return;
           down_bb_[expert_idx]->from_raw_mat(
               (uint8_t*)config_.down_proj +
                   ((logical_expert_id * config_.hidden_size * config_.intermediate_size) >> 1),
