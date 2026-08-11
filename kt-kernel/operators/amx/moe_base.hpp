@@ -204,6 +204,14 @@ class AMX_MOE_BASE {
     derived_const()->write_weights_to_buffer(std::forward<Args>(args)...);
   }
 
+  // The TP wrapper holds its partitions as the CRTP BASE, so a method defined
+  // only on the derived backend is invisible to it without this forwarder --
+  // which is why write_weights_to_buffer needs one too.
+  template <typename... Args>
+  void install_expert_from_raw(Args&&... args) {
+    derived()->install_expert_from_raw(std::forward<Args>(args)...);
+  }
+
   void forward_prefill(int qlen, int k, const int64_t* expert_ids, const float* weights, const void* input,
                        void* output) {
     auto pool = config_.pool->get_subpool(tp_part_idx);
