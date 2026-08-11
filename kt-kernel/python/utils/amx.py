@@ -1112,6 +1112,22 @@ class NativeMoEWrapper(BaseMoEWrapper):
         # The CPUInfer.sync() call blocks until pending tasks complete.
         self.cpu_infer.sync()
 
+    def verify_install_against_loaded(self, expert_id, gate, up, down, gate_scale, up_scale, down_scale):
+        """Bitwise: does the install reproduce the bulk load for this expert?
+
+        Synchronous and read-only -- a diagnostic, not a serving path. Runs on
+        an expert that IS resident, so it can compare against known-good bytes.
+        """
+        if self.moe is None:
+            raise RuntimeError("MoE instance not initialized")
+        if not hasattr(self.moe, "verify_install_against_loaded"):
+            raise NotImplementedError("backend has no verify_install_against_loaded")
+        return bool(
+            self.moe.verify_install_against_loaded(
+                expert_id, gate, up, down, gate_scale, up_scale, down_scale
+            )
+        )
+
     def swap_expert_slot(
         self,
         promote_id: int,

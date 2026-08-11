@@ -668,6 +668,15 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
                 py::arg("demote_id"), py::arg("gate"), py::arg("up"), py::arg("down"), py::arg("gate_scale"),
                 py::arg("up_scale"), py::arg("down_scale"));
   }
+
+  // Bitwise gate on the demotion install: does it reproduce, byte for byte,
+  // what the bulk load produced for the SAME expert? Synchronous -- this is a
+  // diagnostic, not a serving path.
+  if constexpr (requires { &MoeClass::verify_install_against_loaded; }) {
+    moe_cls.def("verify_install_against_loaded", &MoeClass::verify_install_against_loaded, py::arg("expert_id"),
+                py::arg("gate"), py::arg("up"), py::arg("down"), py::arg("gate_scale"), py::arg("up_scale"),
+                py::arg("down_scale"));
+  }
 }
 
 PYBIND11_MODULE(kt_kernel_ext, m) {

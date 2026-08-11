@@ -212,6 +212,11 @@ class AMX_MOE_BASE {
     derived()->install_expert_from_raw(std::forward<Args>(args)...);
   }
 
+  template <typename... Args>
+  bool verify_install_against_loaded(Args&&... args) {
+    return derived()->verify_install_against_loaded(std::forward<Args>(args)...);
+  }
+
   void forward_prefill(int qlen, int k, const int64_t* expert_ids, const float* weights, const void* input,
                        void* output) {
     auto pool = config_.pool->get_subpool(tp_part_idx);

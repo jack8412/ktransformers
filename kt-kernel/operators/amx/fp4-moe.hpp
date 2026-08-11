@@ -14,6 +14,7 @@
 #ifndef CPUINFER_OPERATOR_AMX_FP4_MOE_H
 #define CPUINFER_OPERATOR_AMX_FP4_MOE_H
 
+#include <atomic>
 #include <cstdlib>
 #include <map>
 #include <mutex>
@@ -597,16 +598,33 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     up_bb_[promote_id] = nullptr;
     down_bb_[promote_id] = nullptr;
 
+    fill_expert_buffers(gate_bb_[demote_id], up_bb_[demote_id], down_bb_[demote_id], gate, up, down, gate_scale,
+                        up_scale, down_scale, full_intermediate);
+  }
+
+  /// \brief Fill three BufferBs from one expert's raw checkpoint bytes.
+  ///
+  /// Shared by the install and its bitwise verifier, deliberately: a check
+  /// that reimplements what it checks verifies nothing.
+  template <typename BB>
+  void fill_expert_buffers(BB& gate_bb, BB& up_bb, BB& down_bb, intptr_t gate, intptr_t up, intptr_t down,
+                           intptr_t gate_scale, intptr_t up_scale, intptr_t down_scale, int full_intermediate) {
+    const int group_size = config_.quant_config.group_size;
+    const size_t H = config_.hidden_size;
+    const size_t I = config_.intermediate_size;
+    const size_t wec = I * H;
+    const size_t sec = (H / group_size) * I;
+    const size_t i = (size_t)tp_part_idx;
+
     // from_raw_mat wants a contiguous source, and the staging arenas are
-    // released after the bulk load, so slice into a scratch buffer. One
-    // expert of one partition, on a path that runs a handful of times per
-    // swap window -- not worth an arena.
+    // released after the bulk load, so slice into scratch. One expert of one
+    // partition, a handful of times per swap window -- not worth an arena.
     std::vector<uint8_t> tmp(wec >> 1);
 
     std::memcpy(tmp.data(), (const uint8_t*)gate + ((i * wec) >> 1), wec >> 1);
-    gate_bb_[demote_id]->from_raw_mat(tmp.data(), 0, 1);
+    gate_bb->from_raw_mat(tmp.data(), 0, 1);
     std::memcpy(tmp.data(), (const uint8_t*)up + ((i * wec) >> 1), wec >> 1);
-    up_bb_[demote_id]->from_raw_mat(tmp.data(), 0, 1);
+    up_bb->from_raw_mat(tmp.data(), 0, 1);
 
     // down is [hidden, intermediate]: each column carries this partition's
     // slice of the full intermediate dimension.
@@ -614,15 +632,56 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
       std::memcpy(tmp.data() + ((col * I) >> 1),
                   (const uint8_t*)down + (((col * (size_t)full_intermediate) + i * I) >> 1), I >> 1);
     }
-    down_bb_[demote_id]->from_raw_mat(tmp.data(), 0, 1);
+    down_bb->from_raw_mat(tmp.data(), 0, 1);
 
-    std::memcpy(gate_bb_[demote_id]->d, (const uint8_t*)gate_scale + i * sec, sec);
-    std::memcpy(up_bb_[demote_id]->d, (const uint8_t*)up_scale + i * sec, sec);
+    std::memcpy(gate_bb->d, (const uint8_t*)gate_scale + i * sec, sec);
+    std::memcpy(up_bb->d, (const uint8_t*)up_scale + i * sec, sec);
     const size_t per_col = I / group_size;
     for (size_t col = 0; col < H; col++) {
-      std::memcpy(down_bb_[demote_id]->d + col * per_col,
+      std::memcpy(down_bb->d + col * per_col,
                   (const uint8_t*)down_scale + (col * ((size_t)full_intermediate / group_size) + i * per_col), per_col);
     }
+  }
+
+  /// \brief Does the install reproduce, byte for byte, what the bulk load
+  ///        produced for the SAME expert?
+  ///
+  /// The gate the demotion path actually needs. End-to-end quality can only
+  /// say "something is worse"; this names it. A NUMA slice off by one
+  /// partition writes a valid-looking expert, so nothing downstream fails --
+  /// it just serves another partition's weights, which is exactly the class
+  /// verify_row exists to catch on the GPU side.
+  ///
+  /// Runs on an expert that IS currently resident, filling scratch buffers
+  /// through the same fill_expert_buffers the install uses, and comparing.
+  /// Touches no live state.
+  bool verify_install_against_loaded(int expert_id, intptr_t gate, intptr_t up, intptr_t down, intptr_t gate_scale,
+                                     intptr_t up_scale, intptr_t down_scale, int full_intermediate) {
+    if (gate_bb_[expert_id] == nullptr) throw std::runtime_error("verify: expert is not CPU-resident here");
+
+    const size_t gu_bytes = buffer_b_required_size(config_.intermediate_size, config_.hidden_size);
+    const size_t d_bytes = buffer_b_required_size(config_.hidden_size, config_.intermediate_size);
+
+    void* g = std::aligned_alloc(64, gu_bytes);
+    void* u = std::aligned_alloc(64, gu_bytes);
+    void* d = std::aligned_alloc(64, d_bytes);
+    auto gbb = this->make_buffer_b(config_.intermediate_size, config_.hidden_size, g);
+    auto ubb = this->make_buffer_b(config_.intermediate_size, config_.hidden_size, u);
+    auto dbb = this->make_buffer_b(config_.hidden_size, config_.intermediate_size, d);
+
+    fill_expert_buffers(gbb, ubb, dbb, gate, up, down, gate_scale, up_scale, down_scale, full_intermediate);
+
+    const bool ok = std::memcmp(gbb->b, gate_bb_[expert_id]->b, gu_bytes) == 0 &&
+                    std::memcmp(ubb->b, up_bb_[expert_id]->b, gu_bytes) == 0 &&
+                    std::memcmp(dbb->b, down_bb_[expert_id]->b, d_bytes) == 0;
+
+    gbb.reset();
+    ubb.reset();
+    dbb.reset();
+    std::free(g);
+    std::free(u);
+    std::free(d);
+    return ok;
   }
 
   void load_weights() {
@@ -1038,6 +1097,24 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
       this->tps[i]->install_expert_from_raw(promote_id, demote_id, gate, up, down, gate_scale, up_scale, down_scale,
                                             full_intermediate);
     });
+  }
+
+  /// \brief Bitwise gate on the demotion install, across every partition.
+  ///
+  /// ANDs the per-partition results: a slice that is wrong on one NUMA node
+  /// and right on the others is the most likely way to get this wrong, and
+  /// would pass any check that looked at only one.
+  bool verify_install_against_loaded(int expert_id, intptr_t gate, intptr_t up, intptr_t down, intptr_t gate_scale,
+                                     intptr_t up_scale, intptr_t down_scale) {
+    if (!this->weights_loaded) throw std::runtime_error("Not Loaded");
+    const int full_intermediate = this->config.intermediate_size;
+    std::atomic<int> bad{0};
+    this->config.pool->dispense_backend()->do_numa_job([&, this](int i) {
+      if (!this->tps[i]->verify_install_against_loaded(expert_id, gate, up, down, gate_scale, up_scale, down_scale,
+                                                       full_intermediate))
+        bad.fetch_add(1, std::memory_order_relaxed);
+    });
+    return bad.load(std::memory_order_relaxed) == 0;
   }
 
   void write_weight_scale_to_buffer(int gpu_tp_count, int expert_id, const std::vector<uintptr_t>& w13_weight_ptrs,
