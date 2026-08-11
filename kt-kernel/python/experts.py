@@ -188,6 +188,9 @@ class KTMoEWrapper:
         # (activation_situ_linear_beta). 0.0 = disabled (standard silu).
         situ_beta: float = 0.0,
         situ_linear_beta: float = 0.0,
+        # Hold weights only for experts this CPU actually serves. Read at
+        # MOEConfig construction, before the per-expert buffers are allocated.
+        cold_only_cpu_experts: bool = False,
     ):
         """
         Factory method to create the appropriate backend implementation.
@@ -262,8 +265,17 @@ class KTMoEWrapper:
                 swiglu_alpha=swiglu_alpha,
                 situ_beta=situ_beta,
                 situ_linear_beta=situ_linear_beta,
+                cold_only_cpu_experts=cold_only_cpu_experts,
             )
         else:  # mode == "sft"
+            if cold_only_cpu_experts:
+                # Dropping it would allocate every expert while the caller
+                # believes otherwise -- silent over-allocation that looks
+                # exactly like the feature not working.
+                raise ValueError(
+                    "cold_only_cpu_experts is not supported in mode='sft'; "
+                    "SFT backends load every expert unconditionally."
+                )
             # SFT factory does not plumb swiglu_limit; reject non-zero
             # rather than dropping it on the floor. Origin: kt-sglang 耦合.
             if swiglu_limit != 0.0:
@@ -372,6 +384,7 @@ def _create_inference_wrapper(
     swiglu_alpha: float = 0.0,
     situ_beta: float = 0.0,
     situ_linear_beta: float = 0.0,
+    cold_only_cpu_experts: bool = False,
 ) -> BaseMoEWrapper:
     """
     Create an inference wrapper based on the method.
@@ -437,6 +450,8 @@ def _create_inference_wrapper(
             )
 
     extra_kwargs = {}
+    if cold_only_cpu_experts:
+        extra_kwargs["cold_only_cpu_experts"] = True
     if situ_beta != 0.0:
         extra_kwargs["situ_beta"] = situ_beta
         extra_kwargs["situ_linear_beta"] = situ_linear_beta
