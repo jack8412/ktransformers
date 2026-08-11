@@ -575,6 +575,51 @@ class BaseMoEWrapper(_MoEBase, ABC):
         cpu[slot].copy_(gpu[slot], non_blocking=True)
         return self.doorbell_ptrs(hidden_states)
 
+    def submit_forward_packed(self, hidden_states, cuda_stream):
+        """Enqueue the CPU forward against the PACKED buffer, copying nothing.
+
+        submit_forward stages three separate D2H copies and then enqueues, all
+        on the CPU stream after the fork -- so the dispatch reaches the poller
+        only once those copies land, which measured as the staging completing
+        AFTER the GPU expert GEMM on 52% of layers. A dispatch that late has no
+        GPU work left to hide behind and exposes the whole CPU latency.
+
+        Split the same work instead: pack_forward_inputs on the MAIN stream
+        before the fork, one flush_forward_inputs D2H after it, then this. The
+        bytes the poller reads are identical and arrive by the same route; only
+        the ordering changes. This is the host-node twin of what the doorbell
+        path already does.
+
+        Deferral is refused rather than silently handled: it enqueues a SECOND
+        task over a second ids ring, and the packed buffer carries only the
+        immediate one, so the deferred half would vanish without an error.
+        """
+        if self.max_deferred_experts_per_token > 0:
+            raise RuntimeError(
+                "packed staging requires deferral off "
+                f"(max_deferred_experts_per_token={self.max_deferred_experts_per_token}); "
+                "the packed buffer carries one ids ring, so a deferred task "
+                "would read the immediate ids and its contribution would be lost"
+            )
+        ptrs = self.doorbell_ptrs(hidden_states)
+        self.cpu_infer.submit_with_cuda_stream(
+            cuda_stream,
+            self.moe.forward_task(
+                ptrs["qlen_ptr"],
+                ptrs["k"],
+                ptrs["expert_ids"],
+                ptrs["weights"],
+                ptrs["input"],
+                ptrs["output"],
+                False,
+                self._allow_inline_empty,
+            ),
+        )
+        # sync_forward reads this to decide how many pending tasks its wait may
+        # tolerate; leaving a stale True from an earlier deferral-enabled run
+        # would let the sync return before this task finished.
+        BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = False
+
     def doorbell_ptrs(self, hidden_states):
         """Ring pointers for THIS batch size, without copying anything.
 
