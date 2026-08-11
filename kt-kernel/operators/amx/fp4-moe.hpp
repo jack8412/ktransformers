@@ -621,10 +621,19 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     // partition, a handful of times per swap window -- not worth an arena.
     std::vector<uint8_t> tmp(wec >> 1);
 
+    // nth MUST match the bulk load's. from_raw_mat's destination offsets are
+    // computed from n_block_size = (n_end - n_block_begin), so the packed AMX
+    // layout is a FUNCTION OF nth: (ptr, 0, 1) covers the whole range but
+    // arranges it differently than the union of (ptr, ith, nth). That was the
+    // bug the bitwise check caught -- correct slices, wrong packing, and
+    // nothing downstream notices.
+    const int nth_gu = T::recommended_nth(config_.intermediate_size);
+    const int nth_down = T::recommended_nth(config_.hidden_size);
+
     std::memcpy(tmp.data(), (const uint8_t*)gate + ((i * wec) >> 1), wec >> 1);
-    gate_bb->from_raw_mat(tmp.data(), 0, 1);
+    for (int ith = 0; ith < nth_gu; ++ith) gate_bb->from_raw_mat(tmp.data(), ith, nth_gu);
     std::memcpy(tmp.data(), (const uint8_t*)up + ((i * wec) >> 1), wec >> 1);
-    up_bb->from_raw_mat(tmp.data(), 0, 1);
+    for (int ith = 0; ith < nth_gu; ++ith) up_bb->from_raw_mat(tmp.data(), ith, nth_gu);
 
     // down is [hidden, intermediate]: each column carries this partition's
     // slice of the full intermediate dimension.
@@ -632,7 +641,7 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
       std::memcpy(tmp.data() + ((col * I) >> 1),
                   (const uint8_t*)down + (((col * (size_t)full_intermediate) + i * I) >> 1), I >> 1);
     }
-    down_bb->from_raw_mat(tmp.data(), 0, 1);
+    for (int ith = 0; ith < nth_down; ++ith) down_bb->from_raw_mat(tmp.data(), ith, nth_down);
 
     std::memcpy(gate_bb->d, (const uint8_t*)gate_scale + i * sec, sec);
     std::memcpy(up_bb->d, (const uint8_t*)up_scale + i * sec, sec);
