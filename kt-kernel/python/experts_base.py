@@ -496,22 +496,54 @@ class BaseMoEWrapper(_MoEBase, ABC):
             "output": output_cpu[slot].data_ptr(),
         }
 
-    def register_doorbell_slot(self, slot_index: int, hidden_states, topk_ids):
+    def doorbell_ptrs(self, hidden_states):
+        """Ring pointers for THIS batch size, without copying anything.
+
+        Registration only needs addresses. Copying here would be wrong as well
+        as wasteful: registration happens on a tier's first forward, which for
+        a captured tier can be inside graph capture, where a copy is recorded
+        rather than executed -- so anything staged at registration time is not
+        actually in the ring.
+        """
+        flat = hidden_states.view(-1, hidden_states.shape[-1])
+        (
+            input_tensor_cpu, immediate_ids_cpu, _deferred_ids_cpu, weights_cpu,
+            output_cpu, bsz_tensor_cpu, _output_gpu,
+        ) = KExpertsCPUBuffer.get_buffer(flat, self.num_experts_per_tok)
+        slot = self.layer_idx % KExpertsCPUBuffer.buffer_depth
+        return {
+            "qlen_ptr": bsz_tensor_cpu[slot].data_ptr(),
+            "k": immediate_ids_cpu[slot].size(-1),
+            "expert_ids": immediate_ids_cpu[slot].data_ptr(),
+            "weights": weights_cpu[slot].data_ptr(),
+            "input": input_tensor_cpu[slot].data_ptr(),
+            "output": output_cpu[slot].data_ptr(),
+        }
+
+    def register_doorbell_slot(self, slot_index: int, hidden_states, topk_ids=None):
         """Bind a doorbell slot to THIS batch size's rings.
 
         Must be called once per (layer, batch size): KExpertsCPUBuffer keys its
         rings by batch size, so a closure registered for one size would have
         the poller read and write another size's buffers -- silently, since the
         shapes are identical. Registration is a host-side operation and
-        allocates nothing, so it is safe to do on the first forward of a tier
-        even while that tier's graph is being captured.
+        allocates no device memory, so it is safe on the first forward of a
+        tier even while that tier's graph is being captured.
+
+        `incremental=False` is hardcoded: the doorbell path requires deferral
+        off (max_deferred_experts_per_token == 0), which the caller enforces at
+        config time, so there is never a pending deferred task to fold in.
         """
-        ptrs = self.stage_forward_inputs(hidden_states, topk_ids, topk_ids.new_zeros(
-            topk_ids.shape, dtype=torch.float32))
+        if self.max_deferred_experts_per_token > 0:
+            raise RuntimeError(
+                "doorbell transport requires deferral off "
+                f"(max_deferred_experts_per_token={self.max_deferred_experts_per_token})"
+            )
+        ptrs = self.doorbell_ptrs(hidden_states)
         self.moe.register_doorbell(
             slot_index, ptrs["qlen_ptr"], ptrs["k"], ptrs["expert_ids"],
             ptrs["weights"], ptrs["input"], ptrs["output"],
-            False, self._allow_inline_empty, self.cpu_infer,
+            False, self._allow_inline_empty,
         )
         return ptrs
 
@@ -527,8 +559,11 @@ class BaseMoEWrapper(_MoEBase, ABC):
             flat, self.num_experts_per_tok
         )
         slot = self.layer_idx % KExpertsCPUBuffer.buffer_depth
-        output_gpu.copy_(output_cpu[slot], non_blocking=True)
-        return output_gpu
+        # output_gpu is a per-depth LIST, like every other ring here; copying
+        # into the list itself would raise, and indexing the wrong depth would
+        # hand the merge another layer's result.
+        output_gpu[slot].copy_(output_cpu[slot], non_blocking=True)
+        return output_gpu[slot]
 
     def sync_forward(self, hidden_states: torch.Tensor, cuda_stream) -> torch.Tensor:
         """

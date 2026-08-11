@@ -20,6 +20,7 @@
 #include <cstring>
 
 #include "cpu_backend/cpuinfer.h"
+#include "cpu_backend/doorbell.h"
 #include "cpu_backend/worker_pool.h"
 #include "operators/common.hpp"
 
@@ -472,6 +473,45 @@ void bind_moe_sft_module(py::module_& moe_module, const char* name) {
 }
 #endif  // defined(__x86_64__) && defined(USE_AMX_AVX_KERNEL)
 
+static void bind_doorbell(py::module_& m) {
+  auto d = m.def_submodule("doorbell", "Device-write/CPU-poll transport for CPU expert forwards");
+  d.def("init", [](int num_slots, int num_pollers) { DoorbellTransport::instance().init(num_slots, num_pollers); });
+  d.def("inited", []() { return DoorbellTransport::instance().inited(); });
+  d.def("num_slots", []() { return DoorbellTransport::instance().num_slots(); });
+  d.def("start", []() { DoorbellTransport::instance().start(); });
+  d.def("stop", []() { DoorbellTransport::instance().stop(); });
+  // One ring word for the whole process; completion is per slot.
+  d.def("ring_dev_addr", []() { return DoorbellTransport::instance().ring_dev_addr(); });
+  d.def("completion_dev_addr", [](int s) { return DoorbellTransport::instance().completion_dev_addr(s); });
+  d.def("served", []() { return DoorbellTransport::instance().served(); });
+  d.def("spins", []() { return DoorbellTransport::instance().spins(); });
+  d.def("unbound", []() { return DoorbellTransport::instance().unbound(); });
+  d.def("work_ns_total", []() { return DoorbellTransport::instance().work_ns_total(); });
+  d.def("work_ns_max", []() { return DoorbellTransport::instance().work_ns_max(); });
+  // Test-only: bind a slot to a closure that does nothing but count. Lets the
+  // transport gates exercise the REAL poller, the real memory ordering and
+  // real captured-graph replay without loading a 2.8T model -- the protocol
+  // bugs this transport can have (a wait satisfied by a stale completion, a
+  // ring consumed twice) are invisible to a smoke test and expensive to
+  // reproduce any other way.
+  // delay_us models real expert work. It is not padding: with a free probe the
+  // poller always wins the race to the output buffer, so a MISSING wait looks
+  // identical to a correct one. Real CPU experts take ~100 us, which is when a
+  // missing wait starts returning stale results -- the negative control has to
+  // reproduce that, or it certifies nothing.
+  d.def("bind_probe", [](int slot, intptr_t counter, int delay_us) {
+    DoorbellTransport::instance().set_work(slot, [counter, delay_us]() {
+      if (delay_us > 0) {
+        auto t0 = std::chrono::steady_clock::now();
+        while (std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count() <
+               delay_us) {
+        }
+      }
+      ++*(volatile uint64_t*)counter;
+    });
+  });
+}
+
 template <typename MoeTP>
 void bind_moe_module(py::module_& moe_module, const char* name) {
   using MoeClass = TP_MOE<MoeTP>;
@@ -499,6 +539,38 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
                              bool>(&MoeBindings::ForwardBindings::cpuinfer_interface))
       .def("inline_empty_forwards",
            [](MoeClass& self) { return self.inline_empty_forwards.load(std::memory_order_relaxed); })
+      // Register this layer's forward as a doorbell slot's work closure. The
+      // body is the SAME decision the host-node callback makes (empty ->
+      // zero-fill inline, else run the forward), relocated rather than
+      // reimplemented: it is already proven byte-identical on the node, and
+      // re-deriving it would forfeit that evidence.
+      //
+      // One slot per (layer, BATCH SIZE). KExpertsCPUBuffer keys its rings by
+      // batch size, so the pointers below are only stable for the batch size
+      // they were taken from; a slot registered once per layer would have the
+      // poller read and write another tier's buffers -- silently, since the
+      // shapes are identical.
+      //
+      // The shared_ptr is captured (not just the raw pointer) so the closure
+      // cannot outlive the MoE it calls into.
+      .def("register_doorbell",
+           [](std::shared_ptr<MoeClass> moe, int slot, intptr_t qlen_ptr, int k, intptr_t expert_ids,
+              intptr_t weights, intptr_t input, intptr_t output, bool incremental, bool allow_inline_empty) {
+             DoorbellTransport::instance().set_work(slot, [=]() {
+               MoeClass* m = moe.get();
+               const int qlen = *(const int*)qlen_ptr;
+               if (allow_inline_empty && !incremental &&
+                   !m->batch_has_cpu_expert(qlen, k, (const int64_t*)expert_ids)) {
+                 std::memset((void*)output, 0, m->output_bytes(qlen));
+                 m->inline_empty_forwards.fetch_add(1, std::memory_order_relaxed);
+                 return;
+               }
+               // Run inline on the poller rather than enqueueing: the whole
+               // point of the transport is to remove a cross-thread hop, and
+               // handing off to the worker pool here would reinstate it.
+               m->forward_binding(qlen_ptr, k, expert_ids, weights, input, output, incremental);
+             });
+           })
       .def("warm_up", &MoeClass::warm_up)
       .def("load_weights", &MoeClass::load_weights)
       .def("forward", &MoeClass::forward_binding);
@@ -550,6 +622,7 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
 }
 
 PYBIND11_MODULE(kt_kernel_ext, m) {
+  bind_doorbell(m);
   py::class_<WorkerPool>(m, "WorkerPool").def(py::init<int>());
   py::class_<WorkerPoolConfig>(m, "WorkerPoolConfig")
       .def(py::init<>())
