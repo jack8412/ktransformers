@@ -28,6 +28,7 @@
 #include "vendors/maca.h"
 #endif
 
+#include "./backend_lock.h"
 #include "./vendors/vendor.h"
 #include "llama.cpp/ggml-impl.h"
 #include "task_queue.h"
@@ -74,7 +75,14 @@ class CPUInfer {
 
   template <typename Func, typename Obj, typename... Args>
   void enqueue(Func f, Obj* obj, Args... args) {
-    task_queue_->enqueue([=]() { std::invoke(f, *obj, args...); });
+    // The lock is what keeps this queue's tasks mutually exclusive with the
+    // doorbell poller, which runs expert forwards inline instead of enqueueing
+    // them. Before the doorbell, being the queue's only worker thread was
+    // enough; it no longer is. See cpu_backend/backend_lock.h.
+    task_queue_->enqueue([=]() {
+      std::lock_guard<std::mutex> lk(kt_backend_mutex());
+      std::invoke(f, *obj, args...);
+    });
   }
 
   void submit(std::pair<intptr_t, intptr_t> params) {

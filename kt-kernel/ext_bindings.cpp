@@ -561,6 +561,10 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
                const int qlen = *(const int*)qlen_ptr;
                if (allow_inline_empty && !incremental &&
                    !m->batch_has_cpu_expert(qlen, k, (const int64_t*)expert_ids)) {
+                 // Deliberately outside the backend lock: this path touches
+                 // only this (layer, batch size)'s own output ring and never
+                 // enters the shared job machinery, so it stays lock-free --
+                 // and it is the majority of layer-steps under margin routing.
                  std::memset((void*)output, 0, m->output_bytes(qlen));
                  m->inline_empty_forwards.fetch_add(1, std::memory_order_relaxed);
                  return;
@@ -568,6 +572,16 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
                // Run inline on the poller rather than enqueueing: the whole
                // point of the transport is to remove a cross-thread hop, and
                // handing off to the worker pool here would reinstate it.
+               //
+               // But the TaskQueue's single worker thread WAS the only thing
+               // serialising callers of the non-reentrant NumaJobDistributor,
+               // and this call leaves that queue. Without the lock, a forward
+               // here races load_weights / warm_up / write_weight_scale_to_buffer
+               // still on the queue, over an unlocked shared std::function --
+               // use-after-free, or a job silently dropped on one NUMA node
+               // whose stale partial output is then merged in as if it were
+               // this step's. See cpu_backend/backend_lock.h.
+               std::lock_guard<std::mutex> lk(kt_backend_mutex());
                m->forward_binding(qlen_ptr, k, expert_ids, weights, input, output, incremental);
              });
            })
