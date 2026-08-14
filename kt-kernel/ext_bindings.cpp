@@ -684,6 +684,9 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
   if constexpr (requires { &MoeClass::expert_buffer_pointers; }) {
     moe_cls.def("expert_buffer_pointers", &MoeClass::expert_buffer_pointers);
   }
+  if constexpr (requires { &MoeClass::expert_buffer_arenas; }) {
+    moe_cls.def("expert_buffer_arenas", &MoeClass::expert_buffer_arenas);
+  }
 }
 
 PYBIND11_MODULE(kt_kernel_ext, m) {

@@ -13,17 +13,22 @@
 // #define FORWARD_TIME_PROFILE
 
 #include <immintrin.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -74,6 +79,74 @@ class AMX_MOE_BASE {
   void* down_ba_pool_ = nullptr;
   void* down_bc_pool_ = nullptr;
 
+  // memfd-backed BufferB arena (KT_BUFFER_B_MEMFD=1; see init()). fd and
+  // mapping are deliberately kept for the process lifetime: the fd is what
+  // gets exported for cross-process mapping, and the BufferB objects hold raw
+  // pointers into the mapping, which today's aligned_alloc buffers also never
+  // release.
+  int bb_arena_fd_ = -1;
+  uint8_t* bb_arena_base_ = nullptr;
+  size_t bb_arena_size_ = 0;
+  size_t bb_arena_used_ = 0;
+
+  static size_t bb_round64(size_t v) { return (v + 63) & ~static_cast<size_t>(63); }
+
+  static bool bb_memfd_enabled() {
+    static const bool on = [] {
+      const char* v = std::getenv("KT_BUFFER_B_MEMFD");
+      return v != nullptr && v[0] != '\0' && !(v[0] == '0' && v[1] == '\0');
+    }();
+    return on;
+  }
+
+  void bb_arena_init(size_t total) {
+    total = bb_round64(total);
+    int fd = memfd_create("kt_bufferb", MFD_CLOEXEC);
+    if (fd < 0) {
+      fprintf(stderr, "[kt] KT_BUFFER_B_MEMFD: memfd_create failed (errno %d); using aligned_alloc\n", errno);
+      return;
+    }
+    if (ftruncate(fd, (off_t)total) != 0) {
+      fprintf(stderr, "[kt] KT_BUFFER_B_MEMFD: ftruncate(%zu) failed (errno %d); using aligned_alloc\n", total, errno);
+      close(fd);
+      return;
+    }
+    void* base = mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (base == MAP_FAILED) {
+      fprintf(stderr, "[kt] KT_BUFFER_B_MEMFD: mmap(%zu) failed (errno %d); using aligned_alloc\n", total, errno);
+      close(fd);
+      return;
+    }
+#ifdef MADV_HUGEPAGE
+    // The old aligned_alloc buffers were anon memory, THP-eligible under
+    // sysfs "always"; shmem pages answer to shmem_enabled instead, which
+    // commonly says "never". Advise unconditionally: inert where shmem THP is
+    // off, restores 2M backing where it is "advise"/"within_size". Best
+    // effort -- a streaming-GEMM TLB concern, never correctness.
+    madvise(base, total, MADV_HUGEPAGE);
+#endif
+    // One line on success so a KT_BUFFER_B_MEMFD=0/1 throughput A/B is
+    // attributable; the fallback branches above already log themselves.
+    fprintf(stderr, "[kt] KT_BUFFER_B_MEMFD: partition arena %zu MiB on memfd %d (shmem pages; THP per shmem_enabled)\n",
+            total >> 20, fd);
+    bb_arena_fd_ = fd;
+    bb_arena_base_ = reinterpret_cast<uint8_t*>(base);
+    bb_arena_size_ = total;
+    bb_arena_used_ = 0;
+  }
+
+  // All BufferB weight storage funnels through here; the arena path must
+  // round to 64 itself because some callers pass unrounded sizes (MXFP4's
+  // required_size self-rounds, other backends' need not).
+  void* bb_alloc(size_t bytes) {
+    if (bb_arena_base_ == nullptr) return std::aligned_alloc(64, bytes);
+    const size_t need = bb_round64(bytes);
+    if (bb_arena_used_ + need > bb_arena_size_) throw std::runtime_error("BufferB arena overflow");
+    void* p = bb_arena_base_ + bb_arena_used_;
+    bb_arena_used_ += need;
+    return p;
+  }
+
   GeneralMOEConfig config_;
   using input_t = ggml_bf16_t;
   using output_t = float;
@@ -110,6 +183,26 @@ class AMX_MOE_BASE {
     m_local_up_output_ptr_.resize(config_.expert_num);
     m_local_down_output_ptr_.resize(config_.expert_num);
 
+    // Resident BufferB storage backing. KT_BUFFER_B_MEMFD=1 switches the
+    // per-matrix aligned_allocs below to a single memfd-backed MAP_SHARED
+    // arena per partition, bump-allocated in expert order, so a consumer
+    // PROCESS can map the same physical pages (fd export:
+    // expert_buffer_arenas). Alignment (64) and lifetime (never freed) are
+    // unchanged, and pages are still first-touched by this partition's bound
+    // loader threads during load_weights, so NUMA placement is unchanged.
+    // On memfd/mmap failure the arena stays null and bb_alloc falls back to
+    // aligned_alloc — same behavior as the flag being off.
+    if (bb_memfd_enabled()) {
+      size_t resident = 0;
+      for (size_t i = 0; i < config_.expert_num; i++) {
+        if (config_.holds_expert_weights((int64_t)i)) resident++;
+      }
+      const size_t per_expert =
+          2 * bb_round64(buffer_b_required_size(config_.intermediate_size, config_.hidden_size)) +
+          bb_round64(buffer_b_required_size(config_.hidden_size, config_.intermediate_size));
+      if (resident > 0) bb_arena_init(resident * per_expert);
+    }
+
     for (size_t i = 0; i < config_.expert_num; i++) {
       gate_up_ba_.push_back(make_buffer_a(config_.max_len, config_.hidden_size, nullptr));
       gate_bc_.push_back(make_buffer_c(config_.max_len, config_.intermediate_size, nullptr));
@@ -136,15 +229,13 @@ class AMX_MOE_BASE {
         continue;
       }
 
-      void* gate_bb_ptr =
-          std::aligned_alloc(64, buffer_b_required_size(config_.intermediate_size, config_.hidden_size));
+      void* gate_bb_ptr = bb_alloc(buffer_b_required_size(config_.intermediate_size, config_.hidden_size));
       gate_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.hidden_size, gate_bb_ptr));
 
-      void* up_bb_ptr = std::aligned_alloc(64, buffer_b_required_size(config_.intermediate_size, config_.hidden_size));
+      void* up_bb_ptr = bb_alloc(buffer_b_required_size(config_.intermediate_size, config_.hidden_size));
       up_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.hidden_size, up_bb_ptr));
 
-      void* down_bb_ptr =
-          std::aligned_alloc(64, buffer_b_required_size(config_.hidden_size, config_.intermediate_size));
+      void* down_bb_ptr = bb_alloc(buffer_b_required_size(config_.hidden_size, config_.intermediate_size));
       down_bb_.push_back(make_buffer_b(config_.hidden_size, config_.intermediate_size, down_bb_ptr));
     }
     // TODO: need update to all *.hpp

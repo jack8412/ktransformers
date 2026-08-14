@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <map>
 #include <mutex>
+#include <tuple>
 #include <utility>
 #include "la/amx_raw_buffers.hpp"  // BufferABF16Impl
 #include "moe_base.hpp"
@@ -1185,6 +1186,70 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
     std::vector<int64_t> geometry = {(int64_t)this->tps.size(), expert_num, (int64_t)tpc0.hidden_size,
                                      (int64_t)tpc0.intermediate_size, (int64_t)this->config.quant_config.group_size};
     return {ptrs, geometry};
+  }
+
+  // Arena form of expert_buffer_pointers, for CROSS-PROCESS mapping.
+  // Meaningful only under KT_BUFFER_B_MEMFD=1 (moe_base.hpp: BufferB then
+  // lives in one memfd-backed MAP_SHARED arena per partition); otherwise
+  // every vector comes back empty and the caller falls back to the
+  // absolute-pointer getter.
+  //
+  // Returns (fds, sizes, bases, offsets, geometry):
+  //   fds[i]/sizes[i]  partition i's memfd and its byte length. The fd is
+  //                    valid in THIS process; ship it over SCM_RIGHTS.
+  //   bases[i]         partition i's mapped address in THIS process, so the
+  //                    local consumer can skip re-mapping.
+  //   offsets          rows [partition * expert_num + e] of 6 offsets into
+  //                    that partition's arena (gate_b, up_b, down_b, gate_d,
+  //                    up_d, down_d), -1 for an expert with no buffers here.
+  //                    Offsets are what make the export address-space
+  //                    independent: base + offset is valid in ANY mapping.
+  //   geometry         identical to expert_buffer_pointers.
+  //
+  // Same stability contract as expert_buffer_pointers: offsets move only
+  // across swap_expert_slot. The mapping itself is never moved or resized.
+  std::tuple<std::vector<int64_t>, std::vector<int64_t>, std::vector<uintptr_t>,
+             std::vector<std::vector<int64_t>>, std::vector<int64_t>>
+  expert_buffer_arenas() const {
+    if (!this->weights_loaded) throw std::runtime_error("Not Loaded");
+    if (this->tps.empty()) throw std::runtime_error("No TP parts initialized");
+
+    const auto& tpc0 = this->tps[0]->config_;
+    const int64_t expert_num = (int64_t)tpc0.expert_num;
+
+    std::vector<int64_t> fds, sizes;
+    std::vector<uintptr_t> bases;
+    std::vector<std::vector<int64_t>> offsets;
+    offsets.reserve(this->tps.size() * expert_num);
+    for (size_t i = 0; i < this->tps.size(); i++) {
+      const auto& tp = static_cast<const AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K>>&>(*this->tps[i]);
+      if (tp.bb_arena_base_ == nullptr) return {};  // not in memfd mode
+      fds.push_back(tp.bb_arena_fd_);
+      sizes.push_back((int64_t)tp.bb_arena_size_);
+      bases.push_back((uintptr_t)tp.bb_arena_base_);
+      const uintptr_t lo = (uintptr_t)tp.bb_arena_base_;
+      const uintptr_t hi = lo + tp.bb_arena_size_;
+      auto off = [&](const uint8_t* p) -> int64_t {
+        const uintptr_t v = (uintptr_t)p;
+        // A pointer outside the arena means some buffer fell back to
+        // aligned_alloc after the arena filled -- a sizing bug that MUST NOT
+        // be exported as a bogus offset.
+        if (v < lo || v >= hi) throw std::runtime_error("BufferB outside its arena");
+        return (int64_t)(v - lo);
+      };
+      for (int64_t e = 0; e < expert_num; e++) {
+        if (tp.gate_bb_[e] == nullptr || tp.up_bb_[e] == nullptr || tp.down_bb_[e] == nullptr) {
+          offsets.push_back({-1, -1, -1, -1, -1, -1});
+          continue;
+        }
+        offsets.push_back({off((const uint8_t*)tp.gate_bb_[e]->b), off((const uint8_t*)tp.up_bb_[e]->b),
+                           off((const uint8_t*)tp.down_bb_[e]->b), off(tp.gate_bb_[e]->d), off(tp.up_bb_[e]->d),
+                           off(tp.down_bb_[e]->d)});
+      }
+    }
+    std::vector<int64_t> geometry = {(int64_t)this->tps.size(), expert_num, (int64_t)tpc0.hidden_size,
+                                     (int64_t)tpc0.intermediate_size, (int64_t)this->config.quant_config.group_size};
+    return {fds, sizes, bases, offsets, geometry};
   }
 
   void write_weight_scale_to_buffer(int gpu_tp_count, int expert_id, const std::vector<uintptr_t>& w13_weight_ptrs,
