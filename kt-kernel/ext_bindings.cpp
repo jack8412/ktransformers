@@ -677,6 +677,13 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
                 py::arg("gate"), py::arg("up"), py::arg("down"), py::arg("gate_scale"), py::arg("up_scale"),
                 py::arg("down_scale"));
   }
+
+  // Addresses of the resident CPU expert buffers, so a consumer can DMA them
+  // and transform on a GPU instead of paying write_weight_scale_to_buffer's
+  // CPU-side export. Read-only: it hands out pointers, it does not copy.
+  if constexpr (requires { &MoeClass::expert_buffer_pointers; }) {
+    moe_cls.def("expert_buffer_pointers", &MoeClass::expert_buffer_pointers);
+  }
 }
 
 PYBIND11_MODULE(kt_kernel_ext, m) {

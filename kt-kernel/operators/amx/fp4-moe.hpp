@@ -1128,6 +1128,51 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
     return bad.load(std::memory_order_relaxed) == 0;
   }
 
+  // Base addresses of the resident CPU expert buffers, one row per NUMA
+  // partition, so a caller can DMA them directly instead of asking kt to hand
+  // the weights over.
+  //
+  // WHY THIS EXISTS. write_weight_scale_to_buffer already exports an expert,
+  // but it EXPORTS: it reads the AMX buffers and expands the E8M0 scales to
+  // bf16, ~38.7 ms of CPU work per layer's cold set out of 57-68 ms total. A
+  // consumer that wants the trtllm layout has to undo that expansion, because
+  // trtllm wants the E8M0 codes back as bytes. These buffers already hold
+  // exactly what such a consumer wants -- nibble-packed FP4 and raw E8M0
+  // scales, in checkpoint layout, written by plain memcpy in load_weights --
+  // so handing over the addresses lets the transform happen on a GPU in
+  // microseconds rather than on the CPU in tens of milliseconds.
+  //
+  // Returns (pointers, geometry):
+  //   pointers[i] = {gate_proj, up_proj, down_proj,
+  //                  gate_scale, up_scale, down_scale} for NUMA partition i
+  //   geometry    = {numa_count, expert_num, hidden_size,
+  //                  intermediate_size_per_partition, group_size}
+  //
+  // Expert e starts at e * (intermediate_size * hidden_size / 2) bytes into a
+  // weight buffer and e * (hidden_size / group_size) * intermediate_size bytes
+  // into a scale buffer. down_proj is COLUMN-BLOCKED per partition (see
+  // load_weights), so a consumer must undo that striding itself.
+  //
+  // The pointers stay valid for the life of this object and the memory is NOT
+  // pinned; a caller that wants DMA out of it must register it.
+  std::pair<std::vector<std::vector<uintptr_t>>, std::vector<int64_t>> expert_buffer_pointers() const {
+    if (!this->weights_loaded) throw std::runtime_error("Not Loaded");
+    if (this->tps.empty()) throw std::runtime_error("No TP parts initialized");
+
+    std::vector<std::vector<uintptr_t>> ptrs;
+    ptrs.reserve(this->tps.size());
+    for (size_t i = 0; i < this->tps.size(); i++) {
+      const auto& tpc = this->tps[i]->config_;
+      ptrs.push_back({(uintptr_t)tpc.gate_proj, (uintptr_t)tpc.up_proj, (uintptr_t)tpc.down_proj,
+                      (uintptr_t)tpc.gate_scale, (uintptr_t)tpc.up_scale, (uintptr_t)tpc.down_scale});
+    }
+    const auto& tpc0 = this->tps[0]->config_;
+    std::vector<int64_t> geometry = {(int64_t)this->tps.size(), (int64_t)tpc0.expert_num,
+                                     (int64_t)tpc0.hidden_size, (int64_t)tpc0.intermediate_size,
+                                     (int64_t)this->config.quant_config.group_size};
+    return {ptrs, geometry};
+  }
+
   void write_weight_scale_to_buffer(int gpu_tp_count, int expert_id, const std::vector<uintptr_t>& w13_weight_ptrs,
                                     const std::vector<uintptr_t>& w13_scale_ptrs,
                                     const std::vector<uintptr_t>& w2_weight_ptrs,
