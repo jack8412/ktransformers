@@ -1128,48 +1128,62 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
     return bad.load(std::memory_order_relaxed) == 0;
   }
 
-  // Base addresses of the resident CPU expert buffers, one row per NUMA
-  // partition, so a caller can DMA them directly instead of asking kt to hand
-  // the weights over.
+  // Per-expert addresses of the PERSISTENT CPU expert buffers (BufferB), one
+  // row of six pointers per (NUMA partition, expert), so a caller can DMA the
+  // bytes directly instead of asking kt to hand them over.
   //
-  // WHY THIS EXISTS. write_weight_scale_to_buffer already exports an expert,
-  // but it EXPORTS: it reads the AMX buffers and expands the E8M0 scales to
-  // bf16, ~38.7 ms of CPU work per layer's cold set out of 57-68 ms total. A
-  // consumer that wants the trtllm layout has to undo that expansion, because
-  // trtllm wants the E8M0 codes back as bytes. These buffers already hold
-  // exactly what such a consumer wants -- nibble-packed FP4 and raw E8M0
-  // scales, in checkpoint layout, written by plain memcpy in load_weights --
-  // so handing over the addresses lets the transform happen on a GPU in
-  // microseconds rather than on the CPU in tens of milliseconds.
+  // WHY BufferB AND NOT tpc.gate_proj: tpc.gate_proj points at
+  // kt_staging_arena, a scratch REUSED BY EVERY LAYER -- exporting it hands
+  // out addresses that alias whichever layer loaded last (learned by
+  // segfault, F2 2026-08-14). The persistent per-expert storage is gate_bb_/
+  // up_bb_/down_bb_, and it holds checkpoint layout: from_raw_mat fills the
+  // weight bytes with a plain row-major memcpy and scales_from_raw keeps the
+  // raw E8M0 codes ("expanded at use time"). write_weights_to_buffer itself
+  // reads these very buffers -- fast_memcpy for weights, fast_e8m0_to_bf16
+  // for scales -- and that scale expansion is the ~38.7 ms of CPU work a
+  // trtllm consumer has to undo, since trtllm wants the codes back as bytes.
   //
   // Returns (pointers, geometry):
-  //   pointers[i] = {gate_proj, up_proj, down_proj,
-  //                  gate_scale, up_scale, down_scale} for NUMA partition i
-  //   geometry    = {numa_count, expert_num, hidden_size,
-  //                  intermediate_size_per_partition, group_size}
+  //   pointers[i * expert_num + e] =
+  //       {gate_b, up_b, down_b, gate_d, up_d, down_d} for partition i,
+  //       expert e -- six zeros when expert e is not CPU-resident here
+  //       (cold-only leaves non-resident experts without buffers).
+  //   geometry = {numa_count, expert_num, hidden_size,
+  //               intermediate_size_per_partition, group_size}
   //
-  // Expert e starts at e * (intermediate_size * hidden_size / 2) bytes into a
-  // weight buffer and e * (hidden_size / group_size) * intermediate_size bytes
-  // into a scale buffer. down_proj is COLUMN-BLOCKED per partition (see
-  // load_weights), so a consumer must undo that striding itself.
+  // Layout per entry: gate/up are [intermediate_per_partition, hidden/2]
+  // bytes row-major; down is [hidden, intermediate_per_partition/2] --
+  // kt's usual column blocking. Scales are raw E8M0, one code per group_size
+  // values, same orientation as their weights.
   //
-  // The pointers stay valid for the life of this object and the memory is NOT
-  // pinned; a caller that wants DMA out of it must register it.
+  // Pointers are stable for the life of this object EXCEPT across
+  // swap_expert_slot, which moves buffer ownership between expert ids; a
+  // caller that swaps must re-fetch. The memory is NOT pinned; DMA requires
+  // registering it.
   std::pair<std::vector<std::vector<uintptr_t>>, std::vector<int64_t>> expert_buffer_pointers() const {
     if (!this->weights_loaded) throw std::runtime_error("Not Loaded");
     if (this->tps.empty()) throw std::runtime_error("No TP parts initialized");
 
-    std::vector<std::vector<uintptr_t>> ptrs;
-    ptrs.reserve(this->tps.size());
-    for (size_t i = 0; i < this->tps.size(); i++) {
-      const auto& tpc = this->tps[i]->config_;
-      ptrs.push_back({(uintptr_t)tpc.gate_proj, (uintptr_t)tpc.up_proj, (uintptr_t)tpc.down_proj,
-                      (uintptr_t)tpc.gate_scale, (uintptr_t)tpc.up_scale, (uintptr_t)tpc.down_scale});
-    }
     const auto& tpc0 = this->tps[0]->config_;
-    std::vector<int64_t> geometry = {(int64_t)this->tps.size(), (int64_t)tpc0.expert_num,
-                                     (int64_t)tpc0.hidden_size, (int64_t)tpc0.intermediate_size,
-                                     (int64_t)this->config.quant_config.group_size};
+    const int64_t expert_num = (int64_t)tpc0.expert_num;
+
+    std::vector<std::vector<uintptr_t>> ptrs;
+    ptrs.reserve(this->tps.size() * expert_num);
+    for (size_t i = 0; i < this->tps.size(); i++) {
+      // Through the base, where gate_bb_ et al. are public; AMX_FP4_MOE_TP's
+      // `using Base::gate_bb_` re-declarations sit in its private section.
+      const auto& tp = static_cast<const AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K>>&>(*this->tps[i]);
+      for (int64_t e = 0; e < expert_num; e++) {
+        if (tp.gate_bb_[e] == nullptr || tp.up_bb_[e] == nullptr || tp.down_bb_[e] == nullptr) {
+          ptrs.push_back({0, 0, 0, 0, 0, 0});
+          continue;
+        }
+        ptrs.push_back({(uintptr_t)tp.gate_bb_[e]->b, (uintptr_t)tp.up_bb_[e]->b, (uintptr_t)tp.down_bb_[e]->b,
+                        (uintptr_t)tp.gate_bb_[e]->d, (uintptr_t)tp.up_bb_[e]->d, (uintptr_t)tp.down_bb_[e]->d});
+      }
+    }
+    std::vector<int64_t> geometry = {(int64_t)this->tps.size(), expert_num, (int64_t)tpc0.hidden_size,
+                                     (int64_t)tpc0.intermediate_size, (int64_t)this->config.quant_config.group_size};
     return {ptrs, geometry};
   }
 
