@@ -111,7 +111,16 @@ class AMX_MOE_BASE {
       close(fd);
       return;
     }
-    void* base = mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    // MAP_POPULATE, and it is load-bearing: without it the loader's
+    // work-stealing threads first-touch-fault this shmem inode CONCURRENTLY,
+    // and shmem faults serialize on the inode's page-cache structures --
+    // measured 29 s/layer for cpp_load_weights vs 1.0 s/layer on the anon
+    // aligned_alloc path (A2 vs F1, same 15.7 GB/layer). Populating here
+    // allocates every page in one in-kernel pass on THIS thread, which is the
+    // partition's membind-bound distributor thread, so NUMA placement is
+    // exactly the old first-touch placement; the memcpys then take only
+    // cheap present-page faults.
+    void* base = mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, 0);
     if (base == MAP_FAILED) {
       fprintf(stderr, "[kt] KT_BUFFER_B_MEMFD: mmap(%zu) failed (errno %d); using aligned_alloc\n", total, errno);
       close(fd);
