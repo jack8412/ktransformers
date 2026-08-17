@@ -1030,19 +1030,46 @@ class NativeMoEWrapper(BaseMoEWrapper):
         self.cpu_infer.sync()
         t5 = time.time()
 
-        # Per-layer page-cache handback, MEMFD MODE ONLY. The anon allocator
-        # never needed it (F1: flat 2.17 s/layer tail without it, and it cost
-        # ~1.05 s/layer), but under KT_BUFFER_B_MEMFD=1 the resident buffers
-        # are shmem: MAP_POPULATE's synchronous allocation loops enter direct
-        # reclaim once checkpoint page cache + shmem approach RAM, and that
-        # was the measured 5.5 s -> 25-80 s/layer collapse over a K3 load's
-        # tail. Gate on the same env the C++ arena gate reads, so the cost is
-        # paid exactly when the collapse is possible. Best effort: a failure
-        # only restores the old reclaim behavior.
+        # Per-layer page-cache handback, MEMFD MODE ONLY, PRESSURE-GATED. The
+        # anon allocator never needed it (F1: flat 2.17 s/layer tail without
+        # it, and it cost ~1.05 s/layer), but under KT_BUFFER_B_MEMFD=1 the
+        # resident buffers are shmem: MAP_POPULATE's synchronous allocation
+        # loops enter direct reclaim once checkpoint page cache + shmem
+        # approach RAM -- the measured 5.5 -> 25-80 s/layer collapse over a
+        # K3 load's tail. Dropping UNCONDITIONALLY, though, destroys cache
+        # the NEXT boot could reuse (user-directed: reboot cycles are the
+        # testing bottleneck, and ~0.4-0.5 TB of checkpoint cache can survive
+        # a serving session). So drop only while MemAvailable is under a
+        # floor: early layers keep their cache, and once shmem growth eats
+        # the headroom each just-loaded layer's ~15 GB is handed back --
+        # populate never enters deep reclaim, and whatever the floor spares
+        # is warm for the next boot. Floor default 192 GB
+        # (KT_MEMFD_DROP_CACHE_FLOOR_GB); 0 disables dropping entirely.
         _memfd = os.environ.get("KT_BUFFER_B_MEMFD", "")
         if _memfd != "" and _memfd != "0":
             try:
-                self.loader.drop_layer_page_cache(base_key)
+                _floor_gb = float(
+                    os.environ.get("KT_MEMFD_DROP_CACHE_FLOOR_GB", "192")
+                )
+                _avail_gb = 0.0
+                if _floor_gb > 0:
+                    with open("/proc/meminfo") as _f:
+                        for _line in _f:
+                            if _line.startswith("MemAvailable"):
+                                _avail_gb = int(_line.split()[1]) / (1 << 20)
+                                break
+                if 0 < _avail_gb < _floor_gb:
+                    if not getattr(NativeMoEWrapper, "_drop_cache_started", False):
+                        NativeMoEWrapper._drop_cache_started = True
+                        logger.info(
+                            "[kt] MemAvailable %.0f GB under the %.0f GB floor: "
+                            "dropping each loaded layer's checkpoint cache from "
+                            "here on (earlier layers' cache stays warm for the "
+                            "next boot)",
+                            _avail_gb,
+                            _floor_gb,
+                        )
+                    self.loader.drop_layer_page_cache(base_key)
             except Exception:
                 pass
 
