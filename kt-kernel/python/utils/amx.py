@@ -1266,3 +1266,26 @@ class NativeMoEWrapper(BaseMoEWrapper):
             )
         )
         self.cpu_infer.sync()
+
+    def move_expert_slot(self, promote_id: int, demote_id: int):
+        """Hand a promoted expert's CPU buffers to a demoted one, UNFILLED.
+
+        The bookkeeping half of swap_expert_slot, for the caller that writes
+        the bytes itself. Under KT_BUFFER_B_MEMFD the BufferB arena is shared
+        memory every GPU rank maps, and each rank owns a disjoint slice of
+        every expert, so the ranks fill the moved buffers in parallel with no
+        gather and no checkpoint read.
+
+        ON RETURN THE BUFFERS STILL HOLD THE PROMOTED EXPERT'S BYTES: the
+        demoted expert is not computable until every rank's write has landed,
+        and the caller owns that barrier.
+        """
+        if self.moe is None:
+            raise RuntimeError("MoE instance not initialized; cannot move expert slot.")
+        if not hasattr(self.moe, "move_expert_slot_task"):
+            raise NotImplementedError(
+                "move_expert_slot_task is not available for this backend; "
+                "the rank-write demotion path needs it."
+            )
+        self.cpu_infer.submit(self.moe.move_expert_slot_task(promote_id, demote_id))
+        self.cpu_infer.sync()

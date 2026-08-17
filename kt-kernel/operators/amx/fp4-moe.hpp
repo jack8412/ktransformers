@@ -592,15 +592,39 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     if (gate_bb_[demote_id] != nullptr)
       throw std::runtime_error("install_expert_from_raw: demoted expert already holds a CPU buffer");
 
+    move_slot_only(promote_id, demote_id);
+
+    fill_expert_buffers(gate_bb_[demote_id], up_bb_[demote_id], down_bb_[demote_id], gate, up, down, gate_scale,
+                        up_scale, down_scale, full_intermediate);
+  }
+
+  /// \brief Hand the promoted expert's BufferBs to the demoted expert, and
+  ///        DO NOT fill them.
+  ///
+  /// The bookkeeping half of install_expert_from_raw, for the caller that
+  /// supplies the bytes itself. Under KT_BUFFER_B_MEMFD the BufferB arena is
+  /// shared memory every GPU rank can map, and each rank owns a disjoint
+  /// slice of every expert -- rows [lr*per_gpu, (lr+1)*per_gpu) of gate/up,
+  /// and the matching column strip of down. So the ranks can write their own
+  /// slices straight into these buffers in parallel, which is bit-identical
+  /// to what fill_expert_buffers would have produced (this backend's
+  /// from_raw_mat is a plain row-major memcpy at the same offsets, and the
+  /// scales are copied verbatim), and needs no all-gather, no rank-0
+  /// bottleneck and no checkpoint read.
+  ///
+  /// AFTER THIS RETURNS THE BUFFERS HOLD THE PROMOTED EXPERT'S BYTES. The
+  /// demoted expert is not computable until every rank has written its
+  /// slice; the caller owns that barrier.
+  void move_slot_only(int promote_id, int demote_id) {
+    if (gate_bb_[promote_id] == nullptr) throw std::runtime_error("move_slot_only: promoted expert holds no buffer");
+    if (gate_bb_[demote_id] != nullptr) throw std::runtime_error("move_slot_only: demoted expert already holds one");
+
     gate_bb_[demote_id] = std::move(gate_bb_[promote_id]);
     up_bb_[demote_id] = std::move(up_bb_[promote_id]);
     down_bb_[demote_id] = std::move(down_bb_[promote_id]);
     gate_bb_[promote_id] = nullptr;
     up_bb_[promote_id] = nullptr;
     down_bb_[promote_id] = nullptr;
-
-    fill_expert_buffers(gate_bb_[demote_id], up_bb_[demote_id], down_bb_[demote_id], gate, up, down, gate_scale,
-                        up_scale, down_scale, full_intermediate);
   }
 
   /// \brief Fill three BufferBs from one expert's raw checkpoint bytes.
@@ -1231,6 +1255,21 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
       this->tps[i]->install_expert_from_raw(promote_id, demote_id, gate, up, down, gate_scale, up_scale, down_scale,
                                             full_intermediate);
     });
+  }
+
+  /// \brief The bookkeeping half of swap_expert_slot: move the buffers, do
+  ///        not fill them. See AMX_FP4_MOE_TP::move_slot_only.
+  ///
+  /// For the rank-write demotion path: every GPU rank maps this partition's
+  /// memfd arena and writes its own disjoint slice of the demoted expert,
+  /// so no caller ever materializes the whole expert. The demoted expert is
+  /// NOT computable until every rank's write has landed -- the caller owns
+  /// that barrier.
+  void move_expert_slot(int promote_id, int demote_id) {
+    if (!this->weights_loaded) throw std::runtime_error("Not Loaded");
+    if (this->tps.empty()) throw std::runtime_error("No TP parts initialized");
+    this->config.pool->dispense_backend()->do_numa_job(
+        [&, this](int i) { this->tps[i]->move_slot_only(promote_id, demote_id); });
   }
 
   /// \brief Bitwise gate on the demotion install, across every partition.

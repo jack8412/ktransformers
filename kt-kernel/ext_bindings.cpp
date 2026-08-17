@@ -719,6 +719,35 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
                 py::arg("up_scale"), py::arg("down_scale"));
   }
 
+  // Bookkeeping-only slot move, for the rank-write demotion path: hand the
+  // promoted expert's BufferBs to the demoted expert and let the GPU ranks
+  // fill them in parallel through the shared memfd arena. Same enqueue
+  // pattern, so it is mutually exclusive with forwards on the backend mutex.
+  if constexpr (requires { &MoeClass::move_expert_slot; }) {
+    struct MoveExpertSlotBindings {
+      struct Args {
+        CPUInfer* cpuinfer;
+        MoeClass* moe;
+        int promote_id;
+        int demote_id;
+      };
+
+      static void inner(void* args) {
+        std::unique_ptr<Args> a((Args*)args);
+        a->cpuinfer->enqueue(&MoeClass::move_expert_slot, a->moe, a->promote_id, a->demote_id);
+      }
+
+      static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<MoeClass> moe, int promote_id,
+                                                              int demote_id) {
+        Args* args = new Args{nullptr, moe.get(), promote_id, demote_id};
+        return std::make_pair((intptr_t)&inner, (intptr_t)args);
+      }
+    };
+
+    moe_cls.def("move_expert_slot_task", &MoveExpertSlotBindings::cpuinfer_interface, py::arg("promote_id"),
+                py::arg("demote_id"));
+  }
+
   // Bitwise gate on the demotion install: does it reproduce, byte for byte,
   // what the bulk load produced for the SAME expert? Synchronous -- this is a
   // diagnostic, not a serving path.
