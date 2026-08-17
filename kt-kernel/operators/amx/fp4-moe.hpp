@@ -809,6 +809,8 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
                                    const std::vector<uintptr_t>& w2_scale_ptrs) const {
     if (cpu_tp_count > gpu_tp_count || gpu_tp_count % cpu_tp_count != 0)
       throw std::runtime_error("write_raw_experts_to_buffer: need cpu_tp <= gpu_tp and divisible");
+    if (gpu_tp_count / cpu_tp_count > 8)
+      throw std::runtime_error("write_raw_experts_to_buffer: fan-out > 8 per partition unsupported");
     const int group_size = config_.quant_config.group_size;
     auto pool = config_.pool->get_subpool(tp_part_idx);
 
@@ -824,31 +826,54 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     const size_t rank_w2_s = per_gpu / group_size;
 
     const int n = (int)expert_ids.size();
-    const int items = n * ranks_per_part;
+    // One item per (expert, kind): kind 0 = the gate/up family (4 big
+    // contiguous memcpys per rank), kind 1 = the down family. Down is the
+    // part that decides the export rate -- a rank's w2 slice is H tiny
+    // (per_gpu/2)-byte pieces, and the first cut copied them per (expert,
+    // rank), re-reading every source row ranks_per_part times through 8M
+    // fast_memcpy calls (measured 64 ms/layer, ~39 GB/s on the down bytes).
+    // Streaming each source row ONCE and fanning it out to every rank while
+    // it sits in L1, scales fused into the same pass, makes the source
+    // strictly sequential and cuts the per-piece overhead by the fan-out.
+    const int items = n * 2;
 
     pool->do_work_stealing_job(
         items, nullptr,
         [&, this, ranks_per_part, H, per_gpu, gu_w, gu_s, part_w2_pitch, part_w2s_pitch, rank_w2_w,
          rank_w2_s](int item) {
-          const int pos = item / ranks_per_part;
-          const int lr = item % ranks_per_part;                  // rank-local-to-partition
-          const int rank = tp_part_idx * ranks_per_part + lr;
+          const int pos = item / 2;
+          const int kind = item % 2;
           const int64_t e = expert_ids[pos];
-          const size_t slot = (size_t)pos * gpu_tp_count + rank;
-          uint8_t* w13_dst = (uint8_t*)w13_weight_ptrs[slot];
-          uint8_t* w13s_dst = (uint8_t*)w13_scale_ptrs[slot];
-          uint8_t* w2_dst = (uint8_t*)w2_weight_ptrs[slot];
-          uint8_t* w2s_dst = (uint8_t*)w2_scale_ptrs[slot];
 
-          fast_memcpy(w13_dst, (uint8_t*)gate_bb_[e]->b + lr * gu_w, gu_w);
-          fast_memcpy(w13_dst + gu_w, (uint8_t*)up_bb_[e]->b + lr * gu_w, gu_w);
-          fast_memcpy(w13s_dst, gate_bb_[e]->d + lr * gu_s, gu_s);
-          fast_memcpy(w13s_dst + gu_s, up_bb_[e]->d + lr * gu_s, gu_s);
-          const uint8_t* w2_src = (const uint8_t*)down_bb_[e]->b + lr * rank_w2_w;
-          const uint8_t* w2s_src = down_bb_[e]->d + lr * rank_w2_s;
+          if (kind == 0) {
+            for (int lr = 0; lr < ranks_per_part; lr++) {
+              const size_t slot = (size_t)pos * gpu_tp_count + tp_part_idx * ranks_per_part + lr;
+              uint8_t* w13_dst = (uint8_t*)w13_weight_ptrs[slot];
+              uint8_t* w13s_dst = (uint8_t*)w13_scale_ptrs[slot];
+              fast_memcpy(w13_dst, (uint8_t*)gate_bb_[e]->b + lr * gu_w, gu_w);
+              fast_memcpy(w13_dst + gu_w, (uint8_t*)up_bb_[e]->b + lr * gu_w, gu_w);
+              fast_memcpy(w13s_dst, gate_bb_[e]->d + lr * gu_s, gu_s);
+              fast_memcpy(w13s_dst + gu_s, up_bb_[e]->d + lr * gu_s, gu_s);
+            }
+            return;
+          }
+
+          uint8_t* w2_dsts[8];
+          uint8_t* w2s_dsts[8];
+          for (int lr = 0; lr < ranks_per_part; lr++) {
+            const size_t slot = (size_t)pos * gpu_tp_count + tp_part_idx * ranks_per_part + lr;
+            w2_dsts[lr] = (uint8_t*)w2_weight_ptrs[slot];
+            w2s_dsts[lr] = (uint8_t*)w2_scale_ptrs[slot];
+          }
+          const uint8_t* w2_base = (const uint8_t*)down_bb_[e]->b;
+          const uint8_t* w2s_base = down_bb_[e]->d;
           for (size_t row = 0; row < H; row++) {
-            fast_memcpy(w2_dst + row * rank_w2_w, w2_src + row * part_w2_pitch, rank_w2_w);
-            fast_memcpy(w2s_dst + row * rank_w2_s, w2s_src + row * part_w2s_pitch, rank_w2_s);
+            const uint8_t* srow = w2_base + row * part_w2_pitch;
+            const uint8_t* ssrow = w2s_base + row * part_w2s_pitch;
+            for (int lr = 0; lr < ranks_per_part; lr++) {
+              fast_memcpy(w2_dsts[lr] + row * rank_w2_w, srow + lr * rank_w2_w, rank_w2_w);
+              fast_memcpy(w2s_dsts[lr] + row * rank_w2_s, ssrow + lr * rank_w2_s, rank_w2_s);
+            }
           }
         },
         nullptr);
