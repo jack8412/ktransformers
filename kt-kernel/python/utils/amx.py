@@ -1030,16 +1030,12 @@ class NativeMoEWrapper(BaseMoEWrapper):
         self.cpu_infer.sync()
         t5 = time.time()
 
-        # This layer's checkpoint bytes are fully copied into the resident
-        # buffers; hand their page cache back NOW so later layers' allocations
-        # never enter direct reclaim (the 5.5 s -> 25-80 s/layer collapse over
-        # the tail of a K3 load). Best effort: a failure only restores the old
-        # reclaim behavior.
-        try:
-            self.loader.drop_layer_page_cache(base_key)
-        except Exception:
-            pass
-
+        # NOTE: the per-layer drop_layer_page_cache call that lived here was
+        # REMOVED. It cost ~1.05 s/layer (two-thirds of the load) and only the
+        # retired memfd design needed it: the reclaim collapse it fixed was
+        # specific to MAP_POPULATE's synchronous shmem loops, while the anon
+        # allocator absorbs the same page-cache pressure invisibly -- F1
+        # (anon, no fadvise) ran layer 92 at 2.17 s with a flat tail.
         del self.gate_weights
         del self.up_weights
         del self.down_weights
