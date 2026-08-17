@@ -789,6 +789,71 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     for (; i < count; i++) dst[i] = e8m0_to_bf16(src[i]);
   }
 
+  // Raw BATCHED export: this partition's per-rank slices of a LIST of
+  // experts, as plain memcpy -- nibble-packed FP4 weights AND raw u8 E8M0
+  // scale codes. No ue8m0->bf16 expansion (a trtllm consumer swizzles the
+  // raw bytes on GPU and wants the codes back as bytes; the expansion was
+  // measured as the dominant cost of the bf16 exporter) and one call per
+  // layer instead of one submit per expert. Destination layout per
+  // (expert, rank) matches build_expert_bytes: w13 = [gate rows; up rows],
+  // scales likewise, w2 = the rank's column block made contiguous.
+  //
+  // Pointer arrays are indexed [expert_pos * gpu_tp_count + rank]. Only the
+  // cpu_tp <= gpu_tp case is implemented (K3: 2 NUMA partitions feeding 8
+  // ranks); the inverse case keeps the per-expert bf16 exporter.
+  void write_raw_experts_to_buffer(int gpu_tp_count, int cpu_tp_count, const GeneralMOEConfig& full_config,
+                                   const std::vector<int64_t>& expert_ids,
+                                   const std::vector<uintptr_t>& w13_weight_ptrs,
+                                   const std::vector<uintptr_t>& w13_scale_ptrs,
+                                   const std::vector<uintptr_t>& w2_weight_ptrs,
+                                   const std::vector<uintptr_t>& w2_scale_ptrs) const {
+    if (cpu_tp_count > gpu_tp_count || gpu_tp_count % cpu_tp_count != 0)
+      throw std::runtime_error("write_raw_experts_to_buffer: need cpu_tp <= gpu_tp and divisible");
+    const int group_size = config_.quant_config.group_size;
+    auto pool = config_.pool->get_subpool(tp_part_idx);
+
+    const int ranks_per_part = gpu_tp_count / cpu_tp_count;
+    const size_t H = config_.hidden_size;
+    const size_t part_I = config_.intermediate_size;             // this partition's rows
+    const size_t per_gpu = full_config.intermediate_size / gpu_tp_count;  // rows per rank
+    const size_t gu_w = per_gpu * H / 2;                         // gate|up weight bytes per rank
+    const size_t gu_s = per_gpu * H / group_size;                // gate|up scale bytes per rank
+    const size_t part_w2_pitch = part_I / 2;                     // src down row pitch
+    const size_t part_w2s_pitch = part_I / group_size;
+    const size_t rank_w2_w = per_gpu / 2;                        // dst down row width
+    const size_t rank_w2_s = per_gpu / group_size;
+
+    const int n = (int)expert_ids.size();
+    const int items = n * ranks_per_part;
+
+    pool->do_work_stealing_job(
+        items, nullptr,
+        [&, this, ranks_per_part, H, per_gpu, gu_w, gu_s, part_w2_pitch, part_w2s_pitch, rank_w2_w,
+         rank_w2_s](int item) {
+          const int pos = item / ranks_per_part;
+          const int lr = item % ranks_per_part;                  // rank-local-to-partition
+          const int rank = tp_part_idx * ranks_per_part + lr;
+          const int64_t e = expert_ids[pos];
+          const size_t slot = (size_t)pos * gpu_tp_count + rank;
+          uint8_t* w13_dst = (uint8_t*)w13_weight_ptrs[slot];
+          uint8_t* w13s_dst = (uint8_t*)w13_scale_ptrs[slot];
+          uint8_t* w2_dst = (uint8_t*)w2_weight_ptrs[slot];
+          uint8_t* w2s_dst = (uint8_t*)w2_scale_ptrs[slot];
+
+          fast_memcpy(w13_dst, (uint8_t*)gate_bb_[e]->b + lr * gu_w, gu_w);
+          fast_memcpy(w13_dst + gu_w, (uint8_t*)up_bb_[e]->b + lr * gu_w, gu_w);
+          fast_memcpy(w13s_dst, gate_bb_[e]->d + lr * gu_s, gu_s);
+          fast_memcpy(w13s_dst + gu_s, up_bb_[e]->d + lr * gu_s, gu_s);
+          const uint8_t* w2_src = (const uint8_t*)down_bb_[e]->b + lr * rank_w2_w;
+          const uint8_t* w2s_src = down_bb_[e]->d + lr * rank_w2_s;
+          for (size_t row = 0; row < H; row++) {
+            fast_memcpy(w2_dst + row * rank_w2_w, w2_src + row * part_w2_pitch, rank_w2_w);
+            fast_memcpy(w2s_dst + row * rank_w2_s, w2s_src + row * part_w2s_pitch, rank_w2_s);
+          }
+        },
+        nullptr);
+  }
+
   void write_weights_to_buffer(int gpu_tp_count, int cpu_tp_count, int expert_id, const GeneralMOEConfig& full_config,
                                const std::vector<uintptr_t>& w13_weight_ptrs,
                                const std::vector<uintptr_t>& w13_scale_ptrs,
@@ -1265,6 +1330,27 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
     this->config.pool->dispense_backend()->do_numa_job([&, this](int i) {
       this->tps[i]->write_weights_to_buffer(gpu_tp_count, this->tp_count, expert_id, this->config, w13_weight_ptrs,
                                             w13_scale_ptrs, w2_weight_ptrs, w2_scale_ptrs);
+    });
+  }
+
+  // Batched raw export (see the partition-level method): one call moves a
+  // LIST of experts' per-rank slices as plain memcpy, raw u8 scales included.
+  // Pointer arrays are [expert_pos * gpu_tp_count + rank].
+  void write_raw_experts_to_buffer(int gpu_tp_count, const std::vector<int64_t>& expert_ids,
+                                   const std::vector<uintptr_t>& w13_weight_ptrs,
+                                   const std::vector<uintptr_t>& w13_scale_ptrs,
+                                   const std::vector<uintptr_t>& w2_weight_ptrs,
+                                   const std::vector<uintptr_t>& w2_scale_ptrs) {
+    if (!this->weights_loaded) throw std::runtime_error("Not Loaded");
+    if (this->tps.empty()) throw std::runtime_error("No TP parts initialized");
+    const size_t want = expert_ids.size() * (size_t)gpu_tp_count;
+    if (w13_weight_ptrs.size() != want || w13_scale_ptrs.size() != want || w2_weight_ptrs.size() != want ||
+        w2_scale_ptrs.size() != want)
+      throw std::runtime_error("Pointer arrays must be n_experts * gpu_tp_count");
+
+    this->config.pool->dispense_backend()->do_numa_job([&, this](int i) {
+      this->tps[i]->write_raw_experts_to_buffer(gpu_tp_count, this->tp_count, this->config, expert_ids,
+                                                w13_weight_ptrs, w13_scale_ptrs, w2_weight_ptrs, w2_scale_ptrs);
     });
   }
 };

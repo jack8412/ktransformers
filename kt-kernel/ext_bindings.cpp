@@ -634,6 +634,51 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
                 py::arg("w2_weight_ptrs"), py::arg("w2_scale_ptrs"));
   }
 
+  // Batched RAW export: a list of experts per call, plain memcpy, raw u8
+  // scale codes (no bf16 expansion). Same enqueue pattern as above so it is
+  // mutually exclusive with forwards on the backend mutex.
+  if constexpr (requires { &MoeClass::write_raw_experts_to_buffer; }) {
+    struct WriteRawExpertsBindings {
+      struct Args {
+        CPUInfer* cpuinfer;
+        MoeClass* moe;
+        int gpu_tp_count;
+        std::vector<int64_t> expert_ids;
+        std::vector<uintptr_t> w13_weight_ptrs;
+        std::vector<uintptr_t> w13_scale_ptrs;
+        std::vector<uintptr_t> w2_weight_ptrs;
+        std::vector<uintptr_t> w2_scale_ptrs;
+      };
+
+      static void inner(void* args) {
+        Args* args_ = (Args*)args;
+        args_->cpuinfer->enqueue(&MoeClass::write_raw_experts_to_buffer, args_->moe, args_->gpu_tp_count,
+                                 args_->expert_ids, args_->w13_weight_ptrs, args_->w13_scale_ptrs,
+                                 args_->w2_weight_ptrs, args_->w2_scale_ptrs);
+      }
+
+      static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<MoeClass> moe, int gpu_tp_count,
+                                                              py::list expert_ids, py::list w13_weight_ptrs,
+                                                              py::list w13_scale_ptrs, py::list w2_weight_ptrs,
+                                                              py::list w2_scale_ptrs) {
+        std::vector<int64_t> ids;
+        std::vector<uintptr_t> w13_vec, w13s_vec, w2_vec, w2s_vec;
+        for (auto item : expert_ids) ids.push_back(py::cast<int64_t>(item));
+        for (auto item : w13_weight_ptrs) w13_vec.push_back(py::cast<uintptr_t>(item));
+        for (auto item : w13_scale_ptrs) w13s_vec.push_back(py::cast<uintptr_t>(item));
+        for (auto item : w2_weight_ptrs) w2_vec.push_back(py::cast<uintptr_t>(item));
+        for (auto item : w2_scale_ptrs) w2s_vec.push_back(py::cast<uintptr_t>(item));
+
+        Args* args = new Args{nullptr, moe.get(), gpu_tp_count, ids, w13_vec, w13s_vec, w2_vec, w2s_vec};
+        return std::make_pair((intptr_t)&inner, (intptr_t)args);
+      }
+    };
+
+    moe_cls.def("write_raw_experts_to_buffer_task", &WriteRawExpertsBindings::cpuinfer_interface,
+                py::arg("gpu_tp_count"), py::arg("expert_ids"), py::arg("w13_weight_ptrs"),
+                py::arg("w13_scale_ptrs"), py::arg("w2_weight_ptrs"), py::arg("w2_scale_ptrs"));
+  }
+
   // Cold-only residency + swapping: hand a promoted expert's CPU buffers to
   // the expert being demoted, and refill them from the checkpoint. Enqueued
   // like every other kt entry point, so the backend mutex keeps it mutually

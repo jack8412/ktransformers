@@ -1122,6 +1122,46 @@ class NativeMoEWrapper(BaseMoEWrapper):
         # The CPUInfer.sync() call blocks until pending tasks complete.
         self.cpu_infer.sync()
 
+    def submit_write_raw_experts_to_buffer(
+        self,
+        gpu_tp_count: int,
+        expert_ids,
+        w13_weight_ptrs,
+        w13_scale_ptrs,
+        w2_weight_ptrs,
+        w2_scale_ptrs,
+    ):
+        """Batched RAW export: one task for a LIST of experts.
+
+        Plain memcpy of nibble-packed weights and raw u8 E8M0 scale codes --
+        no bf16 expansion, no per-expert submit. Pointer lists are indexed
+        [expert_pos * gpu_tp_count + rank] and the destinations follow the
+        build_expert_bytes layout (w13 = [gate rows; up rows], w2 = the
+        rank's column block contiguous). This is the serving-rate export a
+        GPU-swizzling consumer wants; the bf16 exporter above remains for the
+        layerwise-prefill path that needs expanded scales.
+        """
+        if self.moe is None:
+            raise RuntimeError("MoE instance not initialized")
+        if not hasattr(self.moe, "write_raw_experts_to_buffer_task"):
+            raise NotImplementedError(
+                "write_raw_experts_to_buffer_task is not available for this backend"
+            )
+        self.cpu_infer.submit(
+            self.moe.write_raw_experts_to_buffer_task(
+                gpu_tp_count,
+                list(expert_ids),
+                w13_weight_ptrs,
+                w13_scale_ptrs,
+                w2_weight_ptrs,
+                w2_scale_ptrs,
+            )
+        )
+
+    def sync_write_raw_experts_to_buffer(self):
+        """Block until previously submitted raw-export tasks finish."""
+        self.cpu_infer.sync()
+
     def verify_install_against_loaded(self, expert_id, gate, up, down, gate_scale, up_scale, down_scale):
         """Bitwise: does the install reproduce the bulk load for this expert?
 
