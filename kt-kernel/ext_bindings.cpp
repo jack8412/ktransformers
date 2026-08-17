@@ -651,10 +651,15 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
       };
 
       static void inner(void* args) {
-        Args* args_ = (Args*)args;
-        args_->cpuinfer->enqueue(&MoeClass::write_raw_experts_to_buffer, args_->moe, args_->gpu_tp_count,
-                                 args_->expert_ids, args_->w13_weight_ptrs, args_->w13_scale_ptrs,
-                                 args_->w2_weight_ptrs, args_->w2_scale_ptrs);
+        // Owns and frees Args: unlike the boot-time bindings above, this one
+        // runs at serving rate (per layer per prefill pass) carrying four
+        // 2208-entry pointer vectors -- the conventional leak would be
+        // ~600 MB/hour. enqueue takes the vectors by value, so the moves
+        // land in its parameters before the lambda copy completes.
+        std::unique_ptr<Args> a((Args*)args);
+        a->cpuinfer->enqueue(&MoeClass::write_raw_experts_to_buffer, a->moe, a->gpu_tp_count,
+                             std::move(a->expert_ids), std::move(a->w13_weight_ptrs), std::move(a->w13_scale_ptrs),
+                             std::move(a->w2_weight_ptrs), std::move(a->w2_scale_ptrs));
       }
 
       static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<MoeClass> moe, int gpu_tp_count,
@@ -746,8 +751,13 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
   py::class_<CPUInfer>(m, "CPUInfer")
       .def(py::init<int>())
       .def(py::init<WorkerPoolConfig>())
-      .def("submit", &CPUInfer::submit)
-      .def("sync", &CPUInfer::sync, py::arg("allow_n_pending") = 0)
+      // GIL released on both: sync blocks in a condvar for the full task
+      // (30-50 ms for a layer export) and touches no Python state; holding
+      // the GIL there froze every other Python thread in the process --
+      // including the forward thread the export worker exists to unblock.
+      .def("submit", &CPUInfer::submit, py::call_guard<py::gil_scoped_release>())
+      .def("sync", &CPUInfer::sync, py::arg("allow_n_pending") = 0,
+           py::call_guard<py::gil_scoped_release>())
       .def_readwrite("backend_", &CPUInfer::backend_)
 #ifndef KTRANSFORMERS_CPU_ONLY
       .def("sync_with_cuda_stream", &CPUInfer::sync_with_cuda_stream, py::arg("user_cuda_stream"),
