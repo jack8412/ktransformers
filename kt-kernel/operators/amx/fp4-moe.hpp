@@ -789,9 +789,38 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     for (; i < count; i++) dst[i] = e8m0_to_bf16(src[i]);
   }
 
+  // Non-temporal copy for the raw export's destinations. The export's ceiling
+  // is DRAM traffic (read src + RFO + write = 3 transits/byte, measured
+  // 30.7 ms/layer at the node's bandwidth); streaming stores delete the RFO
+  // transit (~14.5 -> ~9.7 GB/layer) AND stop the copies from evicting the
+  // ring reads the concurrent H2D depends on. Falls back to fast_memcpy when
+  // the destination is not 64-aligned or the size is not a 64-multiple (the
+  // 12-byte w2-scale rows); callers must sfence before publishing completion.
+  static inline void fast_memcpy_nt(void* dst, const void* src, size_t n) {
+    uint8_t* d = (uint8_t*)dst;
+    const uint8_t* s = (const uint8_t*)src;
+    if (((uintptr_t)d & 63) || (n & 63)) {
+      fast_memcpy(d, s, n);
+      return;
+    }
+    size_t i = 0;
+    for (; i + 256 <= n; i += 256) {
+      __m512i a = _mm512_loadu_si512((const void*)(s + i));
+      __m512i b = _mm512_loadu_si512((const void*)(s + i + 64));
+      __m512i c = _mm512_loadu_si512((const void*)(s + i + 128));
+      __m512i e = _mm512_loadu_si512((const void*)(s + i + 192));
+      _mm512_stream_si512((__m512i*)(d + i), a);
+      _mm512_stream_si512((__m512i*)(d + i + 64), b);
+      _mm512_stream_si512((__m512i*)(d + i + 128), c);
+      _mm512_stream_si512((__m512i*)(d + i + 192), e);
+    }
+    for (; i < n; i += 64)
+      _mm512_stream_si512((__m512i*)(d + i), _mm512_loadu_si512((const void*)(s + i)));
+  }
+
   // Raw BATCHED export: this partition's per-rank slices of a LIST of
-  // experts, as plain memcpy -- nibble-packed FP4 weights AND raw u8 E8M0
-  // scale codes. No ue8m0->bf16 expansion (a trtllm consumer swizzles the
+  // experts, as plain memcpy of nibble-packed FP4 weights AND raw u8 E8M0
+  // scale codes, streamed past the cache where alignment permits. No ue8m0->bf16 expansion (a trtllm consumer swizzles the
   // raw bytes on GPU and wants the codes back as bytes; the expansion was
   // measured as the dominant cost of the bf16 exporter) and one call per
   // layer instead of one submit per expert. Destination layout per
@@ -850,11 +879,12 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
               const size_t slot = (size_t)pos * gpu_tp_count + tp_part_idx * ranks_per_part + lr;
               uint8_t* w13_dst = (uint8_t*)w13_weight_ptrs[slot];
               uint8_t* w13s_dst = (uint8_t*)w13_scale_ptrs[slot];
-              fast_memcpy(w13_dst, (uint8_t*)gate_bb_[e]->b + lr * gu_w, gu_w);
-              fast_memcpy(w13_dst + gu_w, (uint8_t*)up_bb_[e]->b + lr * gu_w, gu_w);
-              fast_memcpy(w13s_dst, gate_bb_[e]->d + lr * gu_s, gu_s);
-              fast_memcpy(w13s_dst + gu_s, up_bb_[e]->d + lr * gu_s, gu_s);
+              fast_memcpy_nt(w13_dst, (uint8_t*)gate_bb_[e]->b + lr * gu_w, gu_w);
+              fast_memcpy_nt(w13_dst + gu_w, (uint8_t*)up_bb_[e]->b + lr * gu_w, gu_w);
+              fast_memcpy_nt(w13s_dst, gate_bb_[e]->d + lr * gu_s, gu_s);
+              fast_memcpy_nt(w13s_dst + gu_s, up_bb_[e]->d + lr * gu_s, gu_s);
             }
+            _mm_sfence();  // NT stores are weakly ordered; drain before task end
             return;
           }
 
@@ -871,10 +901,12 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
             const uint8_t* srow = w2_base + row * part_w2_pitch;
             const uint8_t* ssrow = w2s_base + row * part_w2s_pitch;
             for (int lr = 0; lr < ranks_per_part; lr++) {
-              fast_memcpy(w2_dsts[lr] + row * rank_w2_w, srow + lr * rank_w2_w, rank_w2_w);
-              fast_memcpy(w2s_dsts[lr] + row * rank_w2_s, ssrow + lr * rank_w2_s, rank_w2_s);
+              fast_memcpy_nt(w2_dsts[lr] + row * rank_w2_w, srow + lr * rank_w2_w, rank_w2_w);
+              // 12-byte rows: below NT granularity, falls back inside.
+              fast_memcpy_nt(w2s_dsts[lr] + row * rank_w2_s, ssrow + lr * rank_w2_s, rank_w2_s);
             }
           }
+          _mm_sfence();  // NT stores are weakly ordered; drain before task end
         },
         nullptr);
   }
