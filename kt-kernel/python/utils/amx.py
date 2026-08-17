@@ -1030,12 +1030,22 @@ class NativeMoEWrapper(BaseMoEWrapper):
         self.cpu_infer.sync()
         t5 = time.time()
 
-        # NOTE: the per-layer drop_layer_page_cache call that lived here was
-        # REMOVED. It cost ~1.05 s/layer (two-thirds of the load) and only the
-        # retired memfd design needed it: the reclaim collapse it fixed was
-        # specific to MAP_POPULATE's synchronous shmem loops, while the anon
-        # allocator absorbs the same page-cache pressure invisibly -- F1
-        # (anon, no fadvise) ran layer 92 at 2.17 s with a flat tail.
+        # Per-layer page-cache handback, MEMFD MODE ONLY. The anon allocator
+        # never needed it (F1: flat 2.17 s/layer tail without it, and it cost
+        # ~1.05 s/layer), but under KT_BUFFER_B_MEMFD=1 the resident buffers
+        # are shmem: MAP_POPULATE's synchronous allocation loops enter direct
+        # reclaim once checkpoint page cache + shmem approach RAM, and that
+        # was the measured 5.5 s -> 25-80 s/layer collapse over a K3 load's
+        # tail. Gate on the same env the C++ arena gate reads, so the cost is
+        # paid exactly when the collapse is possible. Best effort: a failure
+        # only restores the old reclaim behavior.
+        _memfd = os.environ.get("KT_BUFFER_B_MEMFD", "")
+        if _memfd != "" and _memfd != "0":
+            try:
+                self.loader.drop_layer_page_cache(base_key)
+            except Exception:
+                pass
+
         del self.gate_weights
         del self.up_weights
         del self.down_weights
