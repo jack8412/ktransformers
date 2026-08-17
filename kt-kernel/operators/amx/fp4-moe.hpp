@@ -1268,8 +1268,13 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
   void move_expert_slot(int promote_id, int demote_id) {
     if (!this->weights_loaded) throw std::runtime_error("Not Loaded");
     if (this->tps.empty()) throw std::runtime_error("No TP parts initialized");
-    this->config.pool->dispense_backend()->do_numa_job(
-        [&, this](int i) { this->tps[i]->move_slot_only(promote_id, demote_id); });
+    this->config.pool->dispense_backend()->do_numa_job([&, this](int i) {
+      // tps[i] is base-typed and move_slot_only lives on the derived class
+      // only (no CRTP forwarder, deliberately -- other backends have no such
+      // method); the CRTP guarantees the dynamic type, exactly as
+      // write_raw_experts_to_buffer and expert_buffer_pointers do.
+      static_cast<AMX_FP4_MOE_TP<K>&>(*this->tps[i]).move_slot_only(promote_id, demote_id);
+    });
   }
 
   /// \brief Bitwise gate on the demotion install, across every partition.
