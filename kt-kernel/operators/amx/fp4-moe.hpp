@@ -1349,8 +1349,12 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
       throw std::runtime_error("Pointer arrays must be n_experts * gpu_tp_count");
 
     this->config.pool->dispense_backend()->do_numa_job([&, this](int i) {
-      this->tps[i]->write_raw_experts_to_buffer(gpu_tp_count, this->tp_count, this->config, expert_ids,
-                                                w13_weight_ptrs, w13_scale_ptrs, w2_weight_ptrs, w2_scale_ptrs);
+      // tps[i] is base-typed and the raw exporter lives on the derived class
+      // only (no CRTP forwarder on purpose -- other backends don't have it);
+      // the CRTP guarantees the dynamic type, same as expert_buffer_pointers.
+      static_cast<const AMX_FP4_MOE_TP<K>&>(*this->tps[i])
+          .write_raw_experts_to_buffer(gpu_tp_count, this->tp_count, this->config, expert_ids, w13_weight_ptrs,
+                                       w13_scale_ptrs, w2_weight_ptrs, w2_scale_ptrs);
     });
   }
 };
