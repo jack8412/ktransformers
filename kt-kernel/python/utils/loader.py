@@ -131,6 +131,7 @@ class SafeTensorLoader:
         self.file_path_map = {}
         self._st_offsets_cache = {}
         self._loaded_names_by_base = {}
+        self._active_layer_files = set()
 
         found_safetensor = False
         for root, _, files in os.walk(folder_path):
@@ -166,7 +167,13 @@ class SafeTensorLoader:
         file = self.tensor_file_map[key]
         f = self.file_handle_map.get(file)
         if f is None:
-            raise FileNotFoundError(f"File {file} not found in Safetensor files")
+            # drop_layer_page_cache retires handles for shards the sequential
+            # load has moved past; an out-of-order read just reopens.
+            path = self.file_path_map.get(file)
+            if path is None:
+                raise FileNotFoundError(f"File {file} not found in Safetensor files")
+            f = safe_open(path, framework="pt")
+            self.file_handle_map[file] = f
         tensor = f.get_tensor(key)
         return tensor.to(device)
 
@@ -191,42 +198,48 @@ class SafeTensorLoader:
         return offs
 
     def drop_layer_page_cache(self, base_key: str) -> int:
-        """fadvise(DONTNEED) the file ranges one load_experts call consumed.
+        """Hand back the page cache of shards the sequential load moved past.
 
-        The pages have been memcpy'd into the resident buffers and this boot
-        never reads them again, but left cached they force every later
-        layer's allocations into direct reclaim once cache + weights exceed
-        RAM -- measured as a 5.5 s -> 25-80 s per-layer collapse over the
-        last third of a Kimi-K3 load. Dropping them voluntarily keeps free
-        pages ahead of the allocator. Returns bytes advised (best effort;
-        failures cost only the old reclaim behavior).
+        The consumed pages are dead (everything was memcpy'd out), but left
+        cached they force every later layer's allocations into direct reclaim
+        once cache + weights exceed RAM -- measured as a 5.5 s -> 25-80 s
+        per-layer collapse over the tail of a Kimi-K3 load. The subtlety that
+        made a naive per-range fadvise a NO-OP: this loader retains the
+        safetensors mmap handles (deliberately -- rebuilding them cost 778 ms
+        per layer), and POSIX_FADV_DONTNEED silently skips pages still mapped
+        into any page table. So the drop must retire the HANDLE first: when a
+        layer's tensors stop touching a shard the previous layers used, that
+        shard's handle is closed (releasing the mmap; nothing points into it,
+        load_experts copies) and only then is the whole file fadvised out.
+        Out-of-order reads reopen the handle in load_tensor. Best effort
+        throughout; failures cost only the old reclaim behavior.
         """
         names = self._loaded_names_by_base.pop(base_key, None)
         if not names:
             return 0
-        by_file = {}
+        current_files = set()
         for name in names:
             file = self.tensor_file_map.get(name)
             if file is not None:
-                by_file.setdefault(file, []).append(name)
+                current_files.add(file)
+        prev_files = self._active_layer_files
+        self._active_layer_files = current_files
+
         dropped = 0
-        for file, keys in by_file.items():
+        for file in prev_files - current_files:
             path = self.file_path_map.get(file)
             if path is None:
                 continue
+            # Close the handle so the mmap disappears from the page tables --
+            # the precondition for DONTNEED doing anything at all.
+            self.file_handle_map.pop(file, None)
             try:
-                offs = self._safetensors_offsets(path)
                 fd = os.open(path, os.O_RDONLY)
                 try:
-                    for k in keys:
-                        be = offs.get(k)
-                        if be is not None and be[1] > be[0]:
-                            os.posix_fadvise(
-                                fd, be[0], be[1] - be[0], os.POSIX_FADV_DONTNEED
-                            )
-                            dropped += be[1] - be[0]
+                    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
                 finally:
                     os.close(fd)
+                dropped += os.path.getsize(path)
             except OSError:
                 continue
         return dropped
