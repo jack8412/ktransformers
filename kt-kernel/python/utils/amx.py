@@ -1030,6 +1030,16 @@ class NativeMoEWrapper(BaseMoEWrapper):
         self.cpu_infer.sync()
         t5 = time.time()
 
+        # This layer's checkpoint bytes are fully copied into the resident
+        # buffers; hand their page cache back NOW so later layers' allocations
+        # never enter direct reclaim (the 5.5 s -> 25-80 s/layer collapse over
+        # the tail of a K3 load). Best effort: a failure only restores the old
+        # reclaim behavior.
+        try:
+            self.loader.drop_layer_page_cache(base_key)
+        except Exception:
+            pass
+
         del self.gate_weights
         del self.up_weights
         del self.down_weights

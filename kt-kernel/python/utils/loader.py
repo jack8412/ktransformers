@@ -125,6 +125,12 @@ class SafeTensorLoader:
         self.tensor_file_map = {}
         self.tensor_type_map = {}
         self.tensor_device_map = {}
+        # For drop_layer_page_cache: basename -> absolute path, per-file
+        # safetensors data offsets (parsed lazily), and the tensor names each
+        # load_experts call consumed (recorded by loaders that support it).
+        self.file_path_map = {}
+        self._st_offsets_cache = {}
+        self._loaded_names_by_base = {}
 
         found_safetensor = False
         for root, _, files in os.walk(folder_path):
@@ -133,6 +139,7 @@ class SafeTensorLoader:
                 if file.endswith(".safetensors"):
                     found_safetensor = True
                     file_path = os.path.join(root, file)
+                    self.file_path_map[file] = file_path
                     if file not in self.file_handle_map:
                         try:
                             handle = safe_open(file_path, framework="pt")
@@ -162,6 +169,67 @@ class SafeTensorLoader:
             raise FileNotFoundError(f"File {file} not found in Safetensor files")
         tensor = f.get_tensor(key)
         return tensor.to(device)
+
+    def _safetensors_offsets(self, path: str) -> dict:
+        """name -> (absolute_begin, absolute_end) byte range in the file."""
+        cached = self._st_offsets_cache.get(path)
+        if cached is not None:
+            return cached
+        import json
+        import struct
+
+        with open(path, "rb") as f:
+            (hlen,) = struct.unpack("<Q", f.read(8))
+            header = json.loads(f.read(hlen))
+        base = 8 + hlen
+        offs = {
+            k: (base + v["data_offsets"][0], base + v["data_offsets"][1])
+            for k, v in header.items()
+            if k != "__metadata__"
+        }
+        self._st_offsets_cache[path] = offs
+        return offs
+
+    def drop_layer_page_cache(self, base_key: str) -> int:
+        """fadvise(DONTNEED) the file ranges one load_experts call consumed.
+
+        The pages have been memcpy'd into the resident buffers and this boot
+        never reads them again, but left cached they force every later
+        layer's allocations into direct reclaim once cache + weights exceed
+        RAM -- measured as a 5.5 s -> 25-80 s per-layer collapse over the
+        last third of a Kimi-K3 load. Dropping them voluntarily keeps free
+        pages ahead of the allocator. Returns bytes advised (best effort;
+        failures cost only the old reclaim behavior).
+        """
+        names = self._loaded_names_by_base.pop(base_key, None)
+        if not names:
+            return 0
+        by_file = {}
+        for name in names:
+            file = self.tensor_file_map.get(name)
+            if file is not None:
+                by_file.setdefault(file, []).append(name)
+        dropped = 0
+        for file, keys in by_file.items():
+            path = self.file_path_map.get(file)
+            if path is None:
+                continue
+            try:
+                offs = self._safetensors_offsets(path)
+                fd = os.open(path, os.O_RDONLY)
+                try:
+                    for k in keys:
+                        be = offs.get(k)
+                        if be is not None and be[1] > be[0]:
+                            os.posix_fadvise(
+                                fd, be[0], be[1] - be[0], os.POSIX_FADV_DONTNEED
+                            )
+                            dropped += be[1] - be[0]
+                finally:
+                    os.close(fd)
+            except OSError:
+                continue
+        return dropped
 
     def close_all_handles(self):
         """Close all file handles and clear the handle map.
@@ -1261,29 +1329,39 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
         up_scales = [None] * expert_count
         down_scales = [None] * expert_count
 
+        consumed = []
         for exp_id in range(expert_count):
             for proj, dst in (
                 (gate_name, gate_weights),
                 (up_name, up_weights),
                 (down_name, down_weights),
             ):
-                w = self.load_tensor(f"{prefix}.{exp_id}.{proj}.{weight_suffix}", device).contiguous()
+                key = f"{prefix}.{exp_id}.{proj}.{weight_suffix}"
+                w = self.load_tensor(key, device).contiguous()
                 if w.dtype != torch.uint8:
                     w = w.view(torch.uint8)
                 dst[exp_id] = w
+                consumed.append(key)
 
             for proj, dst in (
                 (gate_name, gate_scales),
                 (up_name, up_scales),
                 (down_name, down_scales),
             ):
-                s = self.load_tensor(f"{prefix}.{exp_id}.{proj}.{scale_suffix}", device).contiguous()
+                key = f"{prefix}.{exp_id}.{proj}.{scale_suffix}"
+                s = self.load_tensor(key, device).contiguous()
                 # Keep the ue8m0 codes as raw bytes: the MXFP4 kernels hold them
                 # resident at 1 B/group and expand to fp32 at use time, which is
                 # bit-identical to the old load-time widening but 15% smaller.
                 if s.dtype != torch.uint8:
                     s = s.view(torch.uint8)
                 dst[exp_id] = s
+                consumed.append(key)
+
+        # .contiguous() above copied every byte out of the mmap, so these file
+        # ranges are dead for the rest of the boot; drop_layer_page_cache uses
+        # this record to hand them back before the next layer allocates.
+        self._loaded_names_by_base[base_key] = consumed
 
         print(f"[MXFP4SafeTensorLoader] Loaded {expert_count} experts from {prefix} (*.{weight_suffix})")
         return {
