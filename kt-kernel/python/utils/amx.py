@@ -1049,23 +1049,38 @@ class NativeMoEWrapper(BaseMoEWrapper):
         if _memfd != "" and _memfd != "0":
             try:
                 _floor_gb = float(
-                    os.environ.get("KT_MEMFD_DROP_CACHE_FLOOR_GB", "192")
+                    os.environ.get("KT_MEMFD_DROP_CACHE_FLOOR_GB", "300")
                 )
+                # CGROUP headroom, not MemAvailable: on a cgroup-limited
+                # container the host can show ~500 GB available while the
+                # cgroup sits AT memory.max (D2 boot: 22,901 max-limit hits)
+                # and kernel-side charges fail. Fall back to MemAvailable
+                # only when the cgroup files are unreadable.
                 _avail_gb = 0.0
                 if _floor_gb > 0:
-                    with open("/proc/meminfo") as _f:
-                        for _line in _f:
-                            if _line.startswith("MemAvailable"):
-                                _avail_gb = int(_line.split()[1]) / (1 << 20)
-                                break
+                    try:
+                        with open("/sys/fs/cgroup/memory.max") as _f:
+                            _raw = _f.read().strip()
+                        if _raw == "max":
+                            raise ValueError
+                        with open("/sys/fs/cgroup/memory.current") as _f:
+                            _avail_gb = (int(_raw) - int(_f.read().strip())) / (
+                                1 << 30
+                            )
+                    except (OSError, ValueError):
+                        with open("/proc/meminfo") as _f:
+                            for _line in _f:
+                                if _line.startswith("MemAvailable"):
+                                    _avail_gb = int(_line.split()[1]) / (1 << 20)
+                                    break
                 if 0 < _avail_gb < _floor_gb:
                     if not getattr(NativeMoEWrapper, "_drop_cache_started", False):
                         NativeMoEWrapper._drop_cache_started = True
                         logger.info(
-                            "[kt] MemAvailable %.0f GB under the %.0f GB floor: "
-                            "dropping each loaded layer's checkpoint cache from "
-                            "here on (earlier layers' cache stays warm for the "
-                            "next boot)",
+                            "[kt] memory headroom %.0f GB under the %.0f GB "
+                            "floor: dropping each loaded layer's checkpoint "
+                            "cache from here on (earlier layers' cache stays "
+                            "warm for the next boot)",
                             _avail_gb,
                             _floor_gb,
                         )
