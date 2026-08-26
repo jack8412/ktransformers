@@ -3,6 +3,8 @@
 
 // #define CHECK
 
+#include <immintrin.h>
+
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -25,6 +27,18 @@ static inline float kt_bf16_to_fp32(ggml_bf16_t v) {
   std::memcpy(&out, &bits, sizeof(out));
   return out;
 }
+
+#if defined(__AVX512F__)
+/// 32 bf16 -> two fp32 vectors. Same three instructions as
+/// avx512_32xbf16_to_32xfp32 in operators/amx/utils.hpp, repeated here because
+/// this header is included BEFORE that one and the name would not resolve.
+static inline void kt_reap_load32(const ggml_bf16_t* src, __m512* lo, __m512* hi) {
+  *lo = _mm512_castsi512_ps(
+      _mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm256_loadu_si256((const __m256i*)src)), 16));
+  *hi = _mm512_castsi512_ps(
+      _mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm256_loadu_si256((const __m256i*)src + 1)), 16));
+}
+#endif
 
 // Forward declaration for Llamafile backend type checking
 class LLAMA_MOE_TP;
@@ -290,8 +304,32 @@ class TP_MOE_Common : public MoE_Interface {
             if (r != nullptr) rows_p[n++] = r;
           }
           if (n == 0) return;
+          // Sum the partitions, THEN square. The partition loop is inside the
+          // 32-wide body so the whole thing vectorises; leaving it outside
+          // gives a runtime trip count over indirected pointers, which blocks
+          // vectorisation entirely and lands ~8x slower on a path that runs
+          // inline on the doorbell poller while the GPU waits on it.
           double acc = 0.0;
-          for (int h = 0; h < hidden; ++h) {
+          int h = 0;
+#if defined(__AVX512F__)
+          __m512 a0 = _mm512_setzero_ps();
+          __m512 a1 = _mm512_setzero_ps();
+          for (; h + 32 <= hidden; h += 32) {
+            __m512 s0 = _mm512_setzero_ps();
+            __m512 s1 = _mm512_setzero_ps();
+            for (int q = 0; q < n; ++q) {
+              __m512 d0, d1;
+              kt_reap_load32(rows_p[q] + h, &d0, &d1);
+              s0 = _mm512_add_ps(s0, d0);
+              s1 = _mm512_add_ps(s1, d1);
+            }
+            a0 = _mm512_fmadd_ps(s0, s0, a0);
+            a1 = _mm512_fmadd_ps(s1, s1, a1);
+          }
+          acc = static_cast<double>(_mm512_reduce_add_ps(a0)) +
+                static_cast<double>(_mm512_reduce_add_ps(a1));
+#endif
+          for (; h < hidden; ++h) {
             float v = 0.0f;
             for (int q = 0; q < n; ++q) v += kt_bf16_to_fp32(rows_p[q][h]);
             acc += static_cast<double>(v) * static_cast<double>(v);
