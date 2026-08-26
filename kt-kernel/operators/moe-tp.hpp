@@ -254,8 +254,11 @@ class TP_MOE_Common : public MoE_Interface {
       return;
     } else {
     if (reap_norms_ == nullptr || k != reap_top_k_) return;
-    const int rows = std::min(qlen, reap_max_tokens_);
-    if (rows <= 0) return;
+    // Sized for decode. A longer batch is a prefill shape, and prefill says
+    // nothing about residency -- every expert runs on the GPU there -- so
+    // refuse it rather than measure a prefix of it.
+    if (qlen <= 0 || qlen > reap_max_tokens_) return;
+    const int rows = qlen;
 
     const int hidden = config.hidden_size;
     const int parts = tp_count;
@@ -264,9 +267,20 @@ class TP_MOE_Common : public MoE_Interface {
     // A slot this layer does not own reads back zero, which the caller drops.
     std::memset(out, 0, static_cast<size_t>(rows) * k * sizeof(float));
 
-    config.pool->do_work_stealing_job(
-        rows * k, nullptr,
-        [&parts_ref, out, k, hidden, parts, expert_ids](int t) {
+    // Fan out across NUMA nodes. WorkerPool::do_work_stealing_job runs
+    // everything on node 0's threads alone, which would leave the reads
+    // remote AND serialise them on a sixth of the cores.
+    auto* pool = config.pool;
+    const int total = rows * k;
+    pool->dispense_backend()->do_numa_job([pool, &parts_ref, out, k, hidden, parts,
+                                           expert_ids, total](int numa_id) {
+      const int begin = static_cast<int>(static_cast<int64_t>(total) * numa_id / parts);
+      const int end = static_cast<int>(static_cast<int64_t>(total) * (numa_id + 1) / parts);
+      if (end <= begin) return;
+      pool->get_subpool(numa_id)->do_work_stealing_job(
+        end - begin, nullptr,
+        [&parts_ref, out, k, hidden, parts, expert_ids, begin](int slice_t) {
+          const int t = begin + slice_t;
           const int i = t / k;
           const int j = t % k;
           const ggml_bf16_t* rows_p[kReapMaxPartitions];
@@ -285,6 +299,7 @@ class TP_MOE_Common : public MoE_Interface {
           out[i * k + j] = static_cast<float>(std::sqrt(acc));
         },
         nullptr);
+    });
     }
   }
 
