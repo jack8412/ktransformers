@@ -286,6 +286,19 @@ class AMX_MOE_BASE {
     forward(qlen, config_.num_experts_per_tok, expert_ids.data(), weights.data(), input.data(), output.data());
   }
 
+  /// \brief This partition's output row for (token i, slot j), or nullptr.
+  ///
+  /// The down-projection output stays live until the next forward, so the TP
+  /// layer can read these once do_numa_job has returned and every partition
+  /// has finished. A partition holds a slice of the INTERMEDIATE axis, so the
+  /// row is full length but a partial value: the caller must sum across
+  /// partitions before taking a norm of it.
+  const ggml_bf16_t* reap_row(int i, int j, int k, const int64_t* expert_ids) const {
+    const int64_t e = expert_ids[i * k + j];
+    if (e < 0 || config_.should_skip_expert(e)) return nullptr;
+    return m_local_down_output_ptr_[e] + m_local_pos_[i][j] * config_.hidden_size;
+  }
+
   void forward(int qlen, int k, const int64_t* expert_ids, const float* weights, const void* input, void* output) {
     if (qlen > 1) {
       forward_prefill(qlen, k, expert_ids, weights, input, output);

@@ -4,12 +4,27 @@
 // #define CHECK
 
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <type_traits>
 
 #include "../cpu_backend/shared_mem_buffer.h"
 #include "common.hpp"
+
+/// Partitions whose rows one (token, slot) can be spread over. Sized well
+/// above any real NUMA count; a partition past it is dropped rather than
+/// overrunning the stack array.
+static constexpr int kReapMaxPartitions = 16;
+
+/// bf16 -> fp32 is the bit pattern shifted into the high half.
+static inline float kt_bf16_to_fp32(ggml_bf16_t v) {
+  uint32_t bits = static_cast<uint32_t>(v.bits) << 16;
+  float out;
+  std::memcpy(&out, &bits, sizeof(out));
+  return out;
+}
 
 // Forward declaration for Llamafile backend type checking
 class LLAMA_MOE_TP;
@@ -49,6 +64,14 @@ class TP_MOE_Common : public MoE_Interface {
   // GPU-resident experts (see the forward binding's host callback). Written
   // from the CUDA host-callback thread, read from Python for telemetry.
   std::atomic<uint64_t> inline_empty_forwards{0};
+  // REAP scoring: one norm per (token, slot) this layer computed, written
+  // straight into a pinned host buffer the caller owns. Norms only -- the
+  // weights and expert ids that turn one into a score live on the caller's
+  // side, and so does the knowledge of which rows of a padded decode batch
+  // are real.
+  float* reap_norms_ = nullptr;
+  int reap_max_tokens_ = 0;
+  int reap_top_k_ = 0;
   using input_t = typename T::input_t;
   TP_MOE_Common(const GeneralMOEConfig& config) : config(config) {
     printf("TP MOE layer %d, pool: 0x%lx, expert num: %d, num_experts_per_tok: %d\n", config.layer_idx,
@@ -202,6 +225,69 @@ class TP_MOE_Common : public MoE_Interface {
   // bf16, matching the ggml_bf16_t stores in merge_results().
   size_t output_bytes(int qlen) const { return (size_t)qlen * (size_t)config.hidden_size * sizeof(uint16_t); }
 
+  /// \brief Register the caller's [max_tokens, top_k] fp32 norms buffer.
+  ///
+  /// Bound once at startup and written every forward. Passing 0 detaches.
+  void set_reap_norms_buffer(intptr_t buffer, int max_tokens, int top_k) {
+    reap_norms_ = reinterpret_cast<float*>(buffer);
+    reap_max_tokens_ = max_tokens;
+    reap_top_k_ = top_k;
+  }
+
+  /// \brief Norm of each expert output this layer produced, per (token, slot).
+  ///
+  /// A partition holds a slice of the INTERMEDIATE axis, so its row is full
+  /// length but a partial value and f = sum over partitions. The sum therefore
+  /// has to happen before the norm: squares add across disjoint COORDINATES,
+  /// never across contraction-axis partials. Runs after do_numa_job has
+  /// returned, which is the first point at which every partition's rows are
+  /// complete, and parallelises over (token, slot) rather than inside one
+  /// NUMA node's job -- the reads are cross-node either way, and one node's
+  /// threads doing all of them would serialise the work.
+  void reap_score(int qlen, int k, const int64_t* expert_ids) {
+    // Only the AMX backends expose per-expert rows; everywhere else this
+    // compiles away. K3 runs MXFP4 on AMX, which does.
+    if constexpr (!requires(T& t, const int64_t* ids) { t.reap_row(0, 0, 0, ids); }) {
+      (void)qlen;
+      (void)k;
+      (void)expert_ids;
+      return;
+    } else {
+    if (reap_norms_ == nullptr || k != reap_top_k_) return;
+    const int rows = std::min(qlen, reap_max_tokens_);
+    if (rows <= 0) return;
+
+    const int hidden = config.hidden_size;
+    const int parts = tp_count;
+    float* out = reap_norms_;
+    auto& parts_ref = tps;
+    // A slot this layer does not own reads back zero, which the caller drops.
+    std::memset(out, 0, static_cast<size_t>(rows) * k * sizeof(float));
+
+    config.pool->do_work_stealing_job(
+        rows * k, nullptr,
+        [&parts_ref, out, k, hidden, parts, expert_ids](int t) {
+          const int i = t / k;
+          const int j = t % k;
+          const ggml_bf16_t* rows_p[kReapMaxPartitions];
+          int n = 0;
+          for (int p = 0; p < parts && n < kReapMaxPartitions; ++p) {
+            const ggml_bf16_t* r = parts_ref[p]->reap_row(i, j, k, expert_ids);
+            if (r != nullptr) rows_p[n++] = r;
+          }
+          if (n == 0) return;
+          double acc = 0.0;
+          for (int h = 0; h < hidden; ++h) {
+            float v = 0.0f;
+            for (int q = 0; q < n; ++q) v += kt_bf16_to_fp32(rows_p[q][h]);
+            acc += static_cast<double>(v) * static_cast<double>(v);
+          }
+          out[i * k + j] = static_cast<float>(std::sqrt(acc));
+        },
+        nullptr);
+    }
+  }
+
   void forward(int* qlen_ptr, int k, const int64_t* expert_ids, const float* weights, const void* input, void* output,
                bool incremental) {
     if (weights_loaded == false) [[unlikely]] {
@@ -217,6 +303,7 @@ class TP_MOE_Common : public MoE_Interface {
       tps[numa_id]->forward(qlen, k, expert_ids, weights, input, this->local_output_numa[numa_id]);
     });
 
+    reap_score(qlen, k, expert_ids);
     merge_results(qlen, output, incremental);
 #ifdef FORWARD_TIME_REPORT
     auto end = std::chrono::high_resolution_clock::now();

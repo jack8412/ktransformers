@@ -589,6 +589,11 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
       .def("load_weights", &MoeClass::load_weights)
       .def("forward", &MoeClass::forward_binding);
 
+  // REAP scoring. Guarded because the SFT MoE types do not carry it.
+  if constexpr (requires { &MoeClass::set_reap_norms_buffer; }) {
+    moe_cls.def("set_reap_norms_buffer", &MoeClass::set_reap_norms_buffer);
+  }
+
   // Bind write_weight_scale_to_buffer_task for MoE types that support it
   // Uses SFINAE to detect if MoeClass has write_weight_scale_to_buffer method
   if constexpr (requires { &MoeClass::write_weight_scale_to_buffer; }) {

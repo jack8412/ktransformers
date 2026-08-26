@@ -679,6 +679,17 @@ class BaseMoEWrapper(_MoEBase, ABC):
         )
         return ptrs
 
+    def set_reap_norms_buffer(self, buffer_ptr: int, max_tokens: int, top_k: int) -> None:
+        """Register the caller's [max_tokens, top_k] fp32 buffer for REAP norms.
+
+        Bound once; every forward writes one norm per (token, slot) this layer
+        computed and zero for the slots it does not own. Norms only -- the
+        weights and expert ids that turn one into a score stay on the caller's
+        side, along with the knowledge of which rows of a padded decode batch
+        are real.
+        """
+        self.moe.set_reap_norms_buffer(buffer_ptr, max_tokens, top_k)
+
     def doorbell_output(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Result of the poller's forward, moved to device for the merge.
 
